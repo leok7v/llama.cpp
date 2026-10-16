@@ -207,6 +207,10 @@ struct tensor_metadata {
     std::string     remapped_imatrix_name;
     bool            allows_quantization;
     bool            requires_imatrix;
+    // NVFP4: the per-tensor global scale written beside the weight as <name>.scale (F32, one value per expert).
+    // The GGUF block format stores only a UE4M3 block scale; without a global scale the block scales of ordinary
+    // LLM weights (amax/6 ~ 0.003-0.005) fall into UE4M3's subnormal range and keep one or two significant bits.
+    ggml_tensor *   nvfp4_scale = nullptr;
 };
 
 //
@@ -1051,6 +1055,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // flag for --dry-run
     bool will_require_imatrix = false;
 
+    // metadata-only tensors for the NVFP4 global scales (no data allocated here; the values are written in the main loop)
+    ggml_init_params scales_params = { ggml_tensor_overhead() * (tensors.size() + 1), nullptr, true };
+    ggml_context * ctx_scales = ggml_init(scales_params);
+
     //
     // preliminary iteration over all weights
     //
@@ -1074,6 +1082,20 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
 
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
+
+        if (metadata[i].target_type == GGML_TYPE_NVFP4 && tensor->type != GGML_TYPE_NVFP4 && ggml_n_dims(tensor) >= 2) {
+            const std::string suffix = ".weight";
+            const std::string & wname = metadata[i].name;
+            if (wname.size() > suffix.size() && wname.compare(wname.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                const std::string sname = wname.substr(0, wname.size() - suffix.size()) + ".scale";
+                if (ml.weights_map.find(sname) == ml.weights_map.end()) {
+                    ggml_tensor * ts = ggml_new_tensor_1d(ctx_scales, GGML_TYPE_F32, tensor->ne[2]);
+                    ggml_set_name(ts, sname.c_str());
+                    gguf_add_tensor(ctx_outs[i_split].get(), ts);
+                    metadata[i].nvfp4_scale = ts;
+                }
+            }
+        }
 
         if (params->imatrix) {
             metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped);
@@ -1186,8 +1208,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         size_t new_size;
 
+        // NVFP4 global scale per expert (ne[2]); 1.0 when the tensor gets none
+        std::vector<float> nvfp4_gs;
+
         if (params->dry_run) {
             // the --dry-run option calculates the final quantization size without quantizing
+            if (tm.nvfp4_scale) {
+                total_size_new += ggml_nbytes(tm.nvfp4_scale);
+            }
             if (quantize) {
                 new_size = ggml_nrows(tensor) * ggml_row_size(new_type, tensor->ne[0]);
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB (%s)\n",
@@ -1270,6 +1298,36 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 static const int64_t min_chunk_size = 32 * 512;
                 const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
 
+                if (tm.nvfp4_scale) {
+                    // UE4M3 tops out at 448 and the E2M1 grid at 6: map each expert's largest |w| to a block scale of 448,
+                    // so the block scales use the full E4M3 range. The matmul output is multiplied by the scale again
+                    // (build_lora_mm / build_ffn apply the .scale tensor), so the model is unchanged.
+                    nvfp4_gs.assign(tensor->ne[2], 1.0f);
+                    for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+                        float amax = 0.0f;
+                        for (int64_t ir = 0; ir < nrows; ir += nrows_slab) {
+                            const int64_t nrows_cur = std::min(nrows_slab, nrows - ir);
+                            const int64_t nelements_cur = nrows_cur * n_per_row;
+                            const void * src = load_range((i03*nrows + ir)*row_size_src, nrows_cur*row_size_src);
+                            const float * f32_data;
+                            if (tensor->type == GGML_TYPE_F32) {
+                                f32_data = (const float *) src;
+                            } else {
+                                if (f32_conv_buf.size() < (size_t) nelements_cur) {
+                                    f32_conv_buf.resize(nelements_cur);
+                                }
+                                llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
+                                f32_data = (const float *) f32_conv_buf.data();
+                            }
+                            for (int64_t k = 0; k < nelements_cur; ++k) {
+                                amax = std::max(amax, fabsf(f32_data[k]));
+                            }
+                        }
+                        nvfp4_gs[i03] = amax > 0.0f ? amax / (6.0f * 448.0f) : 1.0f;
+                    }
+                    LLAMA_LOG_INFO("global scale %.3e .. ", nvfp4_gs[0]);
+                }
+
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
@@ -1290,6 +1348,22 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                             }
                             llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
                             f32_data = (const float *) f32_conv_buf.data();
+                        }
+
+                        if (tm.nvfp4_scale) {
+                            // divide by the global scale; an F32 source is copied first so the mapped file is never written
+                            if (f32_conv_buf.size() < (size_t) nelements_cur) {
+                                f32_conv_buf.resize(nelements_cur);
+                            }
+                            float * fd = (float *) f32_conv_buf.data();
+                            if (f32_data != fd) {
+                                memcpy(fd, f32_data, nelements_cur * sizeof(float));
+                            }
+                            const float inv = 1.0f / nvfp4_gs[i03];
+                            for (int64_t k = 0; k < nelements_cur; ++k) {
+                                fd[k] *= inv;
+                            }
+                            f32_data = fd;
                         }
 
                         if (work.size() < nrows_cur*row_size_dst) {
@@ -1317,6 +1391,18 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             // tensor data is already written, add the padding
             zeros(fout, GGML_PAD(new_size, align) - new_size);
 
+            if (tm.nvfp4_scale) {
+                if (nvfp4_gs.empty()) {
+                    nvfp4_gs.assign(tensor->ne[2], 1.0f);
+                }
+                const size_t ssize = ggml_nbytes(tm.nvfp4_scale);
+                GGML_ASSERT(ssize == nvfp4_gs.size() * sizeof(float));
+                GGML_ASSERT(gguf_get_tensor_size(ctx_outs[cur_split].get(), gguf_find_tensor(ctx_outs[cur_split].get(), ggml_get_name(tm.nvfp4_scale))) == ssize);
+                fout.write((const char *) nvfp4_gs.data(), ssize);
+                zeros(fout, GGML_PAD(ssize, align) - ssize);
+                total_size_new += ssize;
+            }
+
             // unmap the tensor to free memory
             if (ml.use_mmap) { ml.unmap_weight(weight); }
 
@@ -1326,6 +1412,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     if (!params->dry_run) {
         close_ofstream();
     }
+    ggml_free(ctx_scales);
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
     LLAMA_LOG_INFO("%s: quant size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_new/1024.0/1024.0, total_size_new*8.0/ml.n_elements);
