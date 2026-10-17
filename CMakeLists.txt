@@ -306,3 +306,8 @@ configure_file(cmake/llama.pc.in
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/llama.pc"
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# Local scratch tools under the gitignored tmp/ (self-disabling if absent).
+if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tmp/gemma-perplexity/CMakeLists.txt)
+    add_subdirectory(tmp/gemma-perplexity)
+endif()

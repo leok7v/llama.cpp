@@ -10,6 +10,7 @@
 #include <cinttypes>
 #include <fstream>
 #include <mutex>
+#include <map>
 #include <regex>
 #include <thread>
 #include <unordered_map>
@@ -1133,6 +1134,29 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     std::vector<no_init<uint8_t>> work;
     std::vector<no_init<float>> f32_conv_buf;
 
+    // SmoothQuant scales: LLAMA_QUANT_SMOOTH=<gguf> with <name>.mul / .col_scale / .row_scale tensors
+    std::map<std::string, const ggml_tensor *> smooth_map;
+    ggml_context * ctx_smooth = nullptr;
+    if (const char * sm_path = getenv("LLAMA_QUANT_SMOOTH")) {
+        gguf_init_params sm_params = { /*no_alloc =*/ false, /*ctx =*/ &ctx_smooth };
+        gguf_context * sm_gguf = gguf_init_from_file(sm_path, sm_params);
+        if (!sm_gguf) {
+            throw std::runtime_error(format("LLAMA_QUANT_SMOOTH: cannot read %s", sm_path));
+        }
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx_smooth); t; t = ggml_get_next_tensor(ctx_smooth, t)) {
+            if (t->type != GGML_TYPE_F32) {
+                continue;   // the I8 data blob gguf_init_from_file creates beside the tensors
+            }
+            smooth_map[ggml_get_name(t)] = t;
+        }
+        gguf_free(sm_gguf);
+        LLAMA_LOG_INFO("%s: SmoothQuant scales from %s: %zu tensors\n", __func__, sm_path, smooth_map.size());
+    }
+    auto smooth_find = [&](const std::string & n) -> const ggml_tensor * {
+        auto it = smooth_map.find(n);
+        return it == smooth_map.end() ? nullptr : it->second;
+    };
+
     const size_t max_buf_size = params->max_buf_size ? params->max_buf_size : LLAMA_QUANT_MAX_BUF_SIZE;
 
     int cur_split = -1;
@@ -1211,6 +1235,37 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         // NVFP4 global scale per expert (ne[2]); 1.0 when the tensor gets none
         std::vector<float> nvfp4_gs;
 
+        const std::string sm_name = ggml_get_name(tensor);
+        const ggml_tensor * sm_mul = smooth_find(sm_name + ".mul");
+        const ggml_tensor * sm_col = smooth_find(sm_name + ".col_scale");
+        const ggml_tensor * sm_row = smooth_find(sm_name + ".row_scale");
+        if (sm_col) { GGML_ASSERT(ggml_nelements(sm_col) == tensor->ne[0]); }
+        if (sm_row) { GGML_ASSERT(ggml_nelements(sm_row) == tensor->ne[1] && tensor->ne[2] == 1); }
+        if (sm_mul) { GGML_ASSERT(ggml_nelements(sm_mul) == ggml_nelements(tensor) && tensor->type == GGML_TYPE_F32); }
+        // scale a slab of rows [row0, row0 + nrows_cur) in place (copied into the conversion buffer first if it is the mapped source)
+        auto smooth_apply = [&](const float * & f32_data, int64_t nelements_cur, int64_t row0, int64_t nrows_cur, int64_t ncols) {
+            if (!sm_col && !sm_row) {
+                return;
+            }
+            if (f32_conv_buf.size() < (size_t) nelements_cur) {
+                f32_conv_buf.resize(nelements_cur);
+            }
+            float * fd = (float *) f32_conv_buf.data();
+            if (f32_data != fd) {
+                memcpy(fd, f32_data, nelements_cur * sizeof(float));
+            }
+            const float * cs = sm_col ? (const float *) sm_col->data : nullptr;
+            const float * rs = sm_row ? (const float *) sm_row->data : nullptr;
+            for (int64_t r = 0; r < nrows_cur; ++r) {
+                float * row = fd + r * ncols;
+                const float rsc = rs ? rs[row0 + r] : 1.0f;
+                for (int64_t k = 0; k < ncols; ++k) {
+                    row[k] *= (cs ? cs[k] : 1.0f) * rsc;
+                }
+            }
+            f32_data = fd;
+        };
+
         if (params->dry_run) {
             // the --dry-run option calculates the final quantization size without quantizing
             if (tm.nvfp4_scale) {
@@ -1242,6 +1297,15 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const size_t row_size   = ggml_row_size(tensor->type, tensor->ne[0]);
                 const size_t slab_size  = std::max<size_t>(row_size, (max_buf_size/row_size)*row_size);
 
+                if (sm_mul) {
+                    std::vector<float> buf((const float *) load_range(0, tensor_size), (const float *) load_range(0, tensor_size) + tensor_size / sizeof(float));
+                    const float * m = (const float *) sm_mul->data;
+                    for (size_t k = 0; k < buf.size(); ++k) {
+                        buf[k] *= m[k];
+                    }
+                    fout.write((const char *) buf.data(), tensor_size);
+                    LLAMA_LOG_INFO("(smoothed) ");
+                } else
                 for (size_t offs = 0; offs < tensor_size; offs += slab_size) {
                     const size_t size = std::min(slab_size, tensor_size - offs);
                     fout.write((const char *) load_range(offs, size), size);
@@ -1319,6 +1383,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                                 llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
                                 f32_data = (const float *) f32_conv_buf.data();
                             }
+                            smooth_apply(f32_data, nelements_cur, i03*nrows + ir, nrows_cur, n_per_row);
                             for (int64_t k = 0; k < nelements_cur; ++k) {
                                 amax = std::max(amax, fabsf(f32_data[k]));
                             }
@@ -1349,6 +1414,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                             llama_tensor_dequantize_impl(tensor->type, src, (float *) f32_conv_buf.data(), workers, nelements_cur, nthread);
                             f32_data = (const float *) f32_conv_buf.data();
                         }
+                        smooth_apply(f32_data, nelements_cur, i03*nrows + ir, nrows_cur, n_per_row);
 
                         if (tm.nvfp4_scale) {
                             // divide by the global scale; an F32 source is copied first so the mapped file is never written
