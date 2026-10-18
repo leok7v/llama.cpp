@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "mmq-fuse.cuh"
 #include "mmq-q40-mma.cuh"
 #include "mmq-q80-mma.cuh"
 
@@ -234,7 +235,13 @@ void ggml_cuda_mul_mat_q(
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+        // the Q8_1 operand comes from mmq-fuse.cu's persistent scratch (reused across matmuls sharing src1, or written by a
+        // fused GEGLU / pre-norm); only the FP4 operand still uses a pool buffer
+        ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+        if (use_native_fp4) {
+            src1_q8_1.alloc(nbytes_src1_q8_1);
+        }
+        const char * src1_q8_1_ptr = src1_q8_1.get();
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
             src1_scale.alloc(ne13*ne12*ne11);
@@ -252,8 +259,7 @@ void ggml_cuda_mul_mat_q(
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
-                                       ne11, ne12, ne13, stream);
+                src1_q8_1_ptr = ggml_cuda_mmq_operand(ctx, src0->type, src1, ne10, ne10_padded, ne11, ne12, ne13, nbytes_src1_q8_1, stream);
             }
             CUDA_CHECK(cudaGetLastError());
         }
@@ -269,7 +275,7 @@ void ggml_cuda_mul_mat_q(
         // sequence as MMQ, bit for bit)
         if (src0->type == GGML_TYPE_Q4_0 && !use_native_fp4 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmq_q40_mma_supported(cc, smpbo, ne00, ne01, ne11)) {
-            ggml_cuda_mmq_q40_mma(src0_d, src1_q8_1.get(), dst_d, ne00, ne01, ne11, s1, nb01, stream);
+            ggml_cuda_mmq_q40_mma(src0_d, src1_q8_1_ptr, dst_d, ne00, ne01, ne11, s1, nb01, stream);
             return;
         }
         // Q8_0 with a batch of tokens on Blackwell (Qwen3.5's ssm_out and attn_output projections): the exact INT8-MMA kernel of
@@ -277,12 +283,12 @@ void ggml_cuda_mul_mat_q(
         // block_q8_1_mmq D4 operand above unchanged (same arithmetic, same rounding sequence as MMQ, bit for bit)
         if (src0->type == GGML_TYPE_Q8_0 && !use_native_fp4 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmq_q80_mma_supported(cc, smpbo, ne00, ne01, ne11)) {
-            ggml_cuda_mmq_q80_mma(src0_d, src1_q8_1.get(), dst_d, ne00, ne01, ne11, s1, nb01, stream);
+            ggml_cuda_mmq_q80_mma(src0_d, src1_q8_1_ptr, dst_d, ne00, ne01, ne11, s1, nb01, stream);
             return;
         }
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1_ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
