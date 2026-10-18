@@ -4529,13 +4529,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // MMQ operand fusions (mmq-fuse.cu): the node being computed, then a GEGLU whose only consumer is an MMQ matmul
-    // (gelu(gate)*up quantized straight into its operand) and a pre-norm whose every consumer is an MMQ matmul (normed
-    // straight into the operand, parked for them)
+    // (gelu(gate)*up quantized straight into its operand), gate/up/GEGLU/down as one fused GEMM + one matmul, and a
+    // pre-norm whose every consumer is an MMQ matmul (normed straight into the operand, parked for them)
     ggml_cuda_mmq_fuse_note_node(cgraph, i);
     if (node->op == GGML_OP_GLU) {
         const int n_extra_mmq = ggml_cuda_mmq_fuse_glu(*cuda_ctx, cgraph, i);
         if (n_extra_mmq > 0) {
             return n_extra_mmq;
+        }
+    }
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int n_extra_gu = ggml_cuda_mmq_fuse_gate_up_glu(*cuda_ctx, cgraph, i);
+        if (n_extra_gu > 0) {
+            return n_extra_gu;
         }
     }
     if (node->op == GGML_OP_RMS_NORM) {
