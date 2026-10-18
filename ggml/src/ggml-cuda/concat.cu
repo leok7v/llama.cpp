@@ -139,6 +139,56 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// dim-0 concat whose second operand is a transposed 2-D view (src1->nb[1] is the element size, src1->nb[0] the row
+// pitch of the matrix underneath): read that matrix coalesced along its rows through a 32x32 tile and write dst
+// coalesced along dim 0. The generic kernel reads it with a stride of one row per thread, which is a factor of
+// eight to sixteen in memory traffic.
+#define CONCAT_TILE 32
+template <typename T>
+static __global__ void __launch_bounds__(CONCAT_TILE * 8) concat_transposed(
+        const char * __restrict__ src1,
+              char * __restrict__ dst,
+           int64_t   ne00,      // columns of dst that come from src0 (skipped here)
+           int64_t   ne10,      // dst columns from src1 = rows of the matrix underneath
+           int64_t   ne1,       // dst rows = columns of the matrix underneath
+           int64_t   ne2,
+          uint64_t   nb10,      // pitch between the matrix's rows (bytes)
+          uint64_t   nb12,
+          uint64_t   nb13,
+          uint64_t   nb1,
+          uint64_t   nb2,
+          uint64_t   nb3) {
+    __shared__ T tile[CONCAT_TILE][CONCAT_TILE + 1];
+
+    const int64_t i3 = blockIdx.z / ne2;
+    const int64_t i2 = blockIdx.z - i3 * ne2;
+    const int64_t r0 = (int64_t) blockIdx.x * CONCAT_TILE;   // matrix row    = dst column - ne00
+    const int64_t c0 = (int64_t) blockIdx.y * CONCAT_TILE;   // matrix column = dst row
+
+    const char * m = src1 + i3 * nb13 + i2 * nb12;
+
+    for (int j = threadIdx.y; j < CONCAT_TILE; j += blockDim.y) {
+        const int64_t r = r0 + j;
+        const int64_t c = c0 + threadIdx.x;
+        if (r < ne10 && c < ne1) {
+            tile[j][threadIdx.x] = *(const T *) (m + r * nb10 + c * sizeof(T));
+        }
+    }
+    __syncthreads();
+    for (int j = threadIdx.y; j < CONCAT_TILE; j += blockDim.y) {
+        const int64_t c = c0 + j;                 // dst row
+        const int64_t r = r0 + threadIdx.x;       // dst column - ne00
+        if (r < ne10 && c < ne1) {
+            *(T *) (dst + i3 * nb3 + i2 * nb2 + c * nb1 + (ne00 + r) * sizeof(T)) = tile[threadIdx.x][j];
+        }
+    }
+}
+
+template <typename T>
+static bool concat_src1_is_transposed_2d(const ggml_tensor * src1) {
+    return src1->nb[1] == sizeof(T) && src1->nb[0] % sizeof(T) == 0 && src1->nb[0] >= (uint64_t) src1->ne[1] * sizeof(T);
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -160,6 +210,22 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (dim == 0 && !ggml_is_quantized(src0->type) && ggml_is_contiguous(dst) && concat_src1_is_transposed_2d<T>(src1)) {
+        // the transposed operand through the tile; the src0 columns (the first ne00 of each row) by the generic kernel
+        const dim3 grid(( src1->ne[0] + CONCAT_TILE - 1) / CONCAT_TILE, (dst->ne[1] + CONCAT_TILE - 1) / CONCAT_TILE, dst->ne[2] * dst->ne[3]);
+        concat_transposed<T><<<grid, dim3(CONCAT_TILE, 8), 0, stream>>>(
+            (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src1->ne[0], dst->ne[1], dst->ne[2],
+            src1->nb[0], src1->nb[2], src1->nb[3], dst->nb[1], dst->nb[2], dst->nb[3]);
+        dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
+        concat_non_cont<T, 0><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            src0->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],   // ne0 := ne00 - only the src0 columns are written
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
