@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "mmq-q40-mma.cuh"
 
 #include <cstdint>
 
@@ -261,6 +262,15 @@ void ggml_cuda_mul_mat_q(
                                 ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
+
+        // Q4_0 with a batch of tokens on Blackwell: the exact INT8-MMA kernel (mmq-q40-mma.cu) takes the GEMM in MMQ's place
+        // when the shape qualifies; it consumes the block_q8_1_mmq operand above unchanged (same arithmetic, same rounding
+        // sequence as MMQ, bit for bit)
+        if (src0->type == GGML_TYPE_Q4_0 && !use_native_fp4 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmq_q40_mma_supported(cc, smpbo, ne00, ne01, ne11)) {
+            ggml_cuda_mmq_q40_mma(src0_d, src1_q8_1.get(), dst_d, ne00, ne01, ne11, s1, nb01, stream);
+            return;
+        }
 
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
