@@ -31,6 +31,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mmq-fuse.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -4527,6 +4528,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // MMQ operand fusions (mmq-fuse.cu): the node being computed, then a GEGLU whose only consumer is an MMQ matmul
+    // (gelu(gate)*up quantized straight into its operand) and a pre-norm whose every consumer is an MMQ matmul (normed
+    // straight into the operand, parked for them)
+    ggml_cuda_mmq_fuse_note_node(cgraph, i);
+    if (node->op == GGML_OP_GLU) {
+        const int n_extra_mmq = ggml_cuda_mmq_fuse_glu(*cuda_ctx, cgraph, i);
+        if (n_extra_mmq > 0) {
+            return n_extra_mmq;
+        }
+    }
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_extra_mmq = ggml_cuda_mmq_fuse_norm(*cuda_ctx, cgraph, i);
+        if (n_extra_mmq > 0) {
+            return n_extra_mmq;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
@@ -4811,6 +4829,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_mmq_fuse_begin_graph(cgraph);   // nothing parked in mmq-fuse.cu survives an evaluation
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
