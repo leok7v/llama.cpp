@@ -20,6 +20,10 @@ int  ggml_cuda_mmq_fuse_glu (ggml_backend_cuda_context & ctx, const ggml_cgraph 
 int  ggml_cuda_mmq_fuse_norm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
 // gate matmul + up matmul + GEGLU as one GEMM writing the down-proj operand, then the down matmul; returns 3 or 0.
 int  ggml_cuda_mmq_fuse_gate_up_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+// RMS_NORM over heads + weight MUL + MUL(SILU(z)) [+ RESHAPE] feeding one MMQ matmul: armed at the RMS_NORM (returns 1, the weight
+// MUL goes with it), fired at the SILU (returns the nodes consumed after it: the MUL and, if present, the RESHAPE)
+int  ggml_cuda_mmq_fuse_norm_gated_arm (ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+int  ggml_cuda_mmq_fuse_norm_gated_fire(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
 // the start of a graph evaluation (nothing parked survives it) and the node being computed
 void ggml_cuda_mmq_fuse_begin_graph(const ggml_cgraph * cgraph);
 void ggml_cuda_mmq_fuse_note_node(const ggml_cgraph * cgraph, int node_idx);
