@@ -3,6 +3,7 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "mmq-q40-mma.cuh"
+#include "mmq-q80-mma.cuh"
 
 #include <cstdint>
 
@@ -269,6 +270,14 @@ void ggml_cuda_mul_mat_q(
         if (src0->type == GGML_TYPE_Q4_0 && !use_native_fp4 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmq_q40_mma_supported(cc, smpbo, ne00, ne01, ne11)) {
             ggml_cuda_mmq_q40_mma(src0_d, src1_q8_1.get(), dst_d, ne00, ne01, ne11, s1, nb01, stream);
+            return;
+        }
+        // Q8_0 with a batch of tokens on Blackwell (Qwen3.5's ssm_out and attn_output projections): the exact INT8-MMA kernel of
+        // mmq-q80-mma.cu, the Q4_0 kernel's sibling, takes the GEMM in MMQ's place when the shape qualifies; it consumes the
+        // block_q8_1_mmq D4 operand above unchanged (same arithmetic, same rounding sequence as MMQ, bit for bit)
+        if (src0->type == GGML_TYPE_Q8_0 && !use_native_fp4 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
+            ggml_cuda_mmq_q80_mma_supported(cc, smpbo, ne00, ne01, ne11)) {
+            ggml_cuda_mmq_q80_mma(src0_d, src1_q8_1.get(), dst_d, ne00, ne01, ne11, s1, nb01, stream);
             return;
         }
 
