@@ -4550,6 +4550,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return n_extra_mmq;
         }
     }
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_extra_g = ggml_cuda_mmq_fuse_norm_gated_arm(*cuda_ctx, cgraph, i);
+        if (n_extra_g > 0) {
+            return n_extra_g;
+        }
+    }
+    if (node->op == GGML_OP_UNARY) {
+        const int n_extra_g = ggml_cuda_mmq_fuse_norm_gated_fire(*cuda_ctx, cgraph, i);
+        if (n_extra_g > 0) {
+            return n_extra_g;
+        }
+    }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);

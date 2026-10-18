@@ -20,18 +20,21 @@ constexpr int FUSE_MIN_TOKENS = 64;   // under that the plain path is cheap and 
 
 
 // ---- quantize_mmq_q8_1, with the value produced on the way in. MODE 0: x. MODE 1 (GEGLU): gelu(x) * g.
-// MODE 2 (norm): rowscale[row] * x * w. MODE 3 (SWIGLU): silu(x) * g. Grid as quantize_mmq_q8_1_cuda launches it:
-// (ne1 rows, ne0/(4*blockDim), 1).
-constexpr int QMODE_GEGLU = 1, QMODE_NORM = 2, QMODE_SWIGLU = 3;   // MODE 0 (plain) has no instantiation here: quantize_mmq_q8_1_cuda runs it
+// MODE 2 (norm): rowscale[row] * x * w. MODE 3 (SWIGLU): silu(x) * g. MODE 4 (gated per-head norm): silu(g) * (rowscale[row*H + i/hd]
+// * x * w[i % hd]) - rms_norm_f32<do_multiply> over each hd-wide head, then unary_gated_op_kernel<op_silu>(z, normed), in that order.
+// Grid as quantize_mmq_q8_1_cuda launches it: (ne1 rows, ne0/(4*blockDim), 1).
+constexpr int QMODE_GEGLU = 1, QMODE_NORM = 2, QMODE_SWIGLU = 3, QMODE_NORM_GATED = 4;   // MODE 0 (plain) has no instantiation here: quantize_mmq_q8_1_cuda runs it
 template <mmq_q8_1_ds_layout ds_layout, int MODE>
 static __global__ void quantize_mmq_q8_1_fused(
         const float * __restrict__ x, const float * __restrict__ g, const float * __restrict__ rowscale, void * __restrict__ vy,
-        const int64_t ne00, const int64_t s01, const int64_t ne0, const int ne1) {
+        const int64_t ne00, const int64_t s01, const int64_t ne0, const int ne1, const float * __restrict__ w, const int64_t hd) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
     GGML_UNUSED(g);
     GGML_UNUSED(rowscale);
+    GGML_UNUSED(w);
+    GGML_UNUSED(hd);
 
     const int64_t i0 = ((int64_t)blockDim.x*blockIdx.y + threadIdx.x)*4;
 
@@ -72,6 +75,22 @@ static __global__ void quantize_mmq_q8_1_fused(
         xi.y *= wi.y;
         xi.z *= wi.z;
         xi.w *= wi.w;
+    } else if constexpr (MODE == QMODE_NORM_GATED) {
+        const float  sc = rowscale[blockIdx.x * (ne00 / hd) + i0 / hd];
+        const float4 wi = i0 < ne00 ? ((const float4 *) w)[(i0 % hd) / 4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const float4 gi = i0 < ne00 ? ((const float4 *) g)[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        xi.x = sc * xi.x;   // rms_norm_f32<do_multiply> on the head: r = scale*x; r *= m
+        xi.y = sc * xi.y;
+        xi.z = sc * xi.z;
+        xi.w = sc * xi.w;
+        xi.x *= wi.x;
+        xi.y *= wi.y;
+        xi.z *= wi.z;
+        xi.w *= wi.w;
+        xi.x = ggml_cuda_op_silu_single(gi.x) * xi.x;   // unary_gated_op_kernel<op_silu>: op(z) * normed
+        xi.y = ggml_cuda_op_silu_single(gi.y) * xi.y;
+        xi.z = ggml_cuda_op_silu_single(gi.z) * xi.z;
+        xi.w = ggml_cuda_op_silu_single(gi.w) * xi.w;
     }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
@@ -170,19 +189,20 @@ static bool rms_rowscale_cuda(const float * x, int64_t stride_row, int ncols, in
 
 template <int MODE>
 static void quantize_fused_cuda(const float * x, const float * g, const float * rowscale, void * vy, ggml_type type_x,
-                                int64_t ne00, int64_t s01, int64_t ne0, int ne1, cudaStream_t stream) {
+                                int64_t ne00, int64_t s01, int64_t ne0, int ne1, cudaStream_t stream,
+                                const float * w = nullptr, int64_t hd = 0) {
     const int64_t block_num_y = (ne0 + 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ - 1) / (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     const dim3 num_blocks(ne1, block_num_y, 1);
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_x)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1_fused<MMQ_Q8_1_DS_LAYOUT_D4, MODE><<<num_blocks, block_size, 0, stream>>>(x, g, rowscale, vy, ne00, s01, ne0, ne1);
+            quantize_mmq_q8_1_fused<MMQ_Q8_1_DS_LAYOUT_D4, MODE><<<num_blocks, block_size, 0, stream>>>(x, g, rowscale, vy, ne00, s01, ne0, ne1, w, hd);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1_fused<MMQ_Q8_1_DS_LAYOUT_DS4, MODE><<<num_blocks, block_size, 0, stream>>>(x, g, rowscale, vy, ne00, s01, ne0, ne1);
+            quantize_mmq_q8_1_fused<MMQ_Q8_1_DS_LAYOUT_DS4, MODE><<<num_blocks, block_size, 0, stream>>>(x, g, rowscale, vy, ne00, s01, ne0, ne1, w, hd);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1_fused<MMQ_Q8_1_DS_LAYOUT_D2S6, MODE><<<num_blocks, block_size, 0, stream>>>(x, g, rowscale, vy, ne00, s01, ne0, ne1);
+            quantize_mmq_q8_1_fused<MMQ_Q8_1_DS_LAYOUT_D2S6, MODE><<<num_blocks, block_size, 0, stream>>>(x, g, rowscale, vy, ne00, s01, ne0, ne1, w, hd);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -201,9 +221,22 @@ struct operand_slot {
 // hook slots: operands whose F32 source is never written. HOOK_IN holds a pre-norm's or a GEGLU's operand for the matmuls that
 // consume it; HOOK_GLU_OUT holds the down-proj operand the fused gate/up GEMM writes while HOOK_IN still holds its input.
 enum { HOOK_IN = 0, HOOK_GLU_OUT = 1, N_HOOKS = 2 };
+// the gated per-head norm pattern, armed at its RMS_NORM node and fired at its SILU node (the gate's own matmul sits between
+// them in the graph order): RMS_NORM(x) -> MUL(w) -> MUL(SILU(z)) [-> RESHAPE] -> one MMQ matmul
+struct gated_norm_pending {
+    bool armed = false;
+    const ggml_cgraph * graph = nullptr;
+    const ggml_tensor * silu = nullptr, * mul2 = nullptr, * operand = nullptr;   // operand: the reshape, or mul2 itself
+    const ggml_tensor * x = nullptr, * w = nullptr, * z = nullptr;
+    int64_t hd = 0, K = 0, T = 0;
+    int n_extra = 0;   // nodes the fire step consumes after the SILU: mul2 (+ the reshape)
+    ggml_type type_x = GGML_TYPE_COUNT;
+};
 struct fuse_state {
     operand_slot plain, hooks[N_HOOKS];
-    float * rowscale = nullptr; size_t rowscale_cap = 0;
+    gated_norm_pending gated;
+    float * rowscale = nullptr; size_t rowscale_cap = 0;             // the pre-norm hook's, used within one call
+    float * rowscale_g = nullptr; size_t rowscale_g_cap = 0;         // the gated norm's, alive from arm to fire
     const ggml_cgraph * cur_graph = nullptr; int cur_node = -1;
     bool announced = false;
 };
@@ -302,6 +335,9 @@ void ggml_cuda_mmq_fuse_begin_graph(const ggml_cgraph * cgraph) {
                        st.hooks[h].remaining, st.hooks[h].src1 ? st.hooks[h].src1->name : "?");
         }
         st.hooks[h].valid = false;
+    }
+    if (st.gated.armed) {
+        GGML_ABORT("mmq-fuse: a gated norm armed at %s was never fired - the graph changed under it\n", st.gated.x ? st.gated.x->name : "?");
     }
     st.plain.valid = false;
     st.cur_graph = cgraph;
@@ -535,3 +571,127 @@ int ggml_cuda_mmq_fuse_gate_up_glu(ggml_backend_cuda_context & ctx, const ggml_c
     GGML_ASSERT(!out.valid);
     return 3;
 }
+
+// RMS_NORM over hd-wide heads -> MUL(w) -> MUL(SILU(z)) [-> RESHAPE] -> one MMQ matmul (a gated output norm before a projection).
+// Armed here: the per-head row scales are computed, the norm and its weight MUL are skipped; the quantize happens at the SILU.
+int ggml_cuda_mmq_fuse_norm_gated_arm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 5 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * norm  = cgraph->nodes[node_idx];
+    const ggml_tensor * mul_w = cgraph->nodes[node_idx + 1];
+    if (norm->op != GGML_OP_RMS_NORM || mul_w->op != GGML_OP_MUL || norm->type != GGML_TYPE_F32 || mul_w->type != GGML_TYPE_F32 ||
+        (norm->flags & GGML_TENSOR_FLAG_OUTPUT) || (mul_w->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        ggml_node_get_use_count(cgraph, node_idx) != 1 || ggml_node_get_use_count(cgraph, node_idx + 1) != 1) {
+        return 0;
+    }
+    const ggml_tensor * x = norm->src[0];
+    const ggml_tensor * w = mul_w->src[0] == norm ? mul_w->src[1] : (mul_w->src[1] == norm ? mul_w->src[0] : nullptr);
+    const int64_t hd = x->ne[0], H = x->ne[1], T = x->ne[2];
+    if (!w || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(w) ||
+        x->ne[3] != 1 || hd % 4 != 0 || hd / 4 > 4096 || H < 1 || T < FUSE_MIN_TOKENS || ggml_nelements(w) != hd ||
+        ((uintptr_t) x->data & 15) != 0 || ((uintptr_t) w->data & 15) != 0 || !ggml_are_same_shape(norm, mul_w) || !ggml_are_same_shape(x, norm)) {
+        return 0;
+    }
+    // the gate: a SILU immediately before the MUL that joins it with the normed tensor; between here and there only nodes that
+    // touch neither (the gate's own matmul)
+    int j = node_idx + 2;
+    for (; j + 1 < cgraph->n_nodes; ++j) {
+        const ggml_tensor * c = cgraph->nodes[j];
+        if (c->op == GGML_OP_MUL && (c->src[0] == mul_w || c->src[1] == mul_w)) {
+            break;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (c->src[k] == mul_w || c->src[k] == norm) {
+                return 0;
+            }
+        }
+    }
+    if (j + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * mul2 = cgraph->nodes[j];
+    const ggml_tensor * silu = mul2->src[0] == mul_w ? mul2->src[1] : mul2->src[0];
+    if (silu != cgraph->nodes[j - 1] || silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
+        silu->type != GGML_TYPE_F32 || mul2->type != GGML_TYPE_F32 || (silu->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        (mul2->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, j - 1) != 1 || ggml_node_get_use_count(cgraph, j) != 1 ||
+        !ggml_is_contiguous(mul2) || !ggml_are_same_shape(mul2, mul_w)) {
+        return 0;
+    }
+    const ggml_tensor * z = silu->src[0];
+    if (z->type != GGML_TYPE_F32 || !ggml_is_contiguous(z) || ggml_nelements(z) != ggml_nelements(x) || ((uintptr_t) z->data & 15) != 0 ||
+        z->ne[0] * z->ne[1] * z->ne[2] * z->ne[3] != hd * H * T) {
+        return 0;
+    }
+    // the consumer: the next node, or a RESHAPE of mul2 and then the next node
+    const ggml_tensor * operand = mul2;
+    int n_extra = 1;
+    const ggml_tensor * mm = cgraph->nodes[j + 1];
+    if (mm->op == GGML_OP_RESHAPE && mm->src[0] == mul2) {
+        if (j + 2 >= cgraph->n_nodes || ggml_node_get_use_count(cgraph, j + 1) != 1) {
+            return 0;
+        }
+        operand = mm;
+        n_extra = 2;
+        mm      = cgraph->nodes[j + 2];
+    }
+    int cc = 0;
+    if (operand->ne[0] != hd * H || operand->ne[1] != T || !mmq_consumer_ok(mm, operand, cc)) {
+        return 0;
+    }
+    fuse_state & st = fuse_state_for(ggml_cuda_get_device());
+    // nothing is parked here (only row scales are written), so a pre-norm operand still waiting for the gate's own matmul
+    // is no obstacle; concurrent streams are (one scratch, one stream)
+    if (st.gated.armed || !ctx.stream_context().concurrent_events.empty()) {
+        return 0;
+    }
+    announce(st, cc);
+    cudaStream_t stream = ctx.stream();
+    const int64_t N = H * T;
+    if (st.rowscale_g_cap < (size_t) N) {
+        if (st.rowscale_g) {
+            CUDA_CHECK(cudaFree(st.rowscale_g));
+        }
+        CUDA_CHECK(cudaMalloc(&st.rowscale_g, (size_t) N * sizeof(float)));
+        st.rowscale_g_cap = (size_t) N;
+    }
+    float eps = 0.0f;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    if (!rms_rowscale_cuda((const float *) x->data, hd, (int) hd, (int) N, eps, st.rowscale_g, stream)) {
+        return 0;
+    }
+    CUDA_CHECK(cudaGetLastError());
+    st.gated.armed = true; st.gated.graph = cgraph; st.gated.silu = silu; st.gated.mul2 = mul2; st.gated.operand = operand;
+    st.gated.x = x; st.gated.w = w; st.gated.z = z; st.gated.hd = hd; st.gated.K = hd * H; st.gated.T = T;
+    st.gated.n_extra = n_extra; st.gated.type_x = mm->src[0]->type;
+    return 1;   // the weight MUL goes with the norm
+}
+
+// the SILU node of an armed pattern: silu(z) * normed quantized straight into the consumer's operand; the MUL (and the reshape) go with it
+int ggml_cuda_mmq_fuse_norm_gated_fire(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    fuse_state & st = fuse_state_for(ggml_cuda_get_device());
+    gated_norm_pending & g = st.gated;
+    if (!g.armed || g.graph != cgraph || cgraph->nodes[node_idx] != g.silu) {
+        return 0;
+    }
+    if (node_idx + g.n_extra >= cgraph->n_nodes || cgraph->nodes[node_idx + 1] != g.mul2) {
+        GGML_ABORT("mmq-fuse: the gated norm armed at %s does not find its MUL after the SILU\n", g.x->name);
+    }
+    operand_slot & hk = st.hooks[HOOK_IN];
+    if (hk.valid && hk.remaining > 0) {
+        GGML_ABORT("mmq-fuse: the gated norm armed at %s fires while an operand for %s is still parked\n", g.x->name, hk.src1 ? hk.src1->name : "?");
+    }
+    if (!ctx.stream_context().concurrent_events.empty()) {
+        GGML_ABORT("mmq-fuse: the gated norm armed at %s fires under concurrent streams\n", g.x->name);
+    }
+    const int64_t ne10_padded = GGML_PAD(g.K, MATRIX_ROW_PADDING);
+    slot_reserve(hk, operand_bytes(ne10_padded, g.T, 1, 1));
+    quantize_fused_cuda<QMODE_NORM_GATED>((const float *) g.x->data, (const float *) g.z->data, st.rowscale_g, hk.buf, g.type_x, g.K,
+                                          g.K, ne10_padded, (int) g.T, ctx.stream(), (const float *) g.w->data, g.hd);
+    CUDA_CHECK(cudaGetLastError());
+    slot_park(hk, cgraph, g.operand, g.type_x, ne10_padded, g.T, 1, 1, /*remaining =*/ 1);   // the matmul, next, takes it
+    const int n_extra = g.n_extra;
+    g.armed = false;
+    return n_extra;
+}
+
