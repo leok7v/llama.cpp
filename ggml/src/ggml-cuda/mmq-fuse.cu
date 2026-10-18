@@ -1,10 +1,12 @@
 // MMQ operand fusions. The quantized src1 operand (block_q8_1_mmq) lives in persistent scratch keyed on the src1 tensor within
 // one graph evaluation, so matmuls sharing an input quantize it once; a GEGLU/SwiGLU or an RMS_NORM+MUL whose consumers are all
-// MMQ matmuls is quantized straight into that operand with quantize_mmq_q8_1's arithmetic, the F32 intermediate never written.
+// MMQ matmuls is quantized straight into that operand with quantize_mmq_q8_1's arithmetic, the F32 intermediate never written;
+// gate, up, GLU and down of an FFN block run as one fused GEMM (mmq-q40-mma-geglu.cu) plus one matmul when the shapes allow.
 // Two slots: PLAIN holds the operand of an existing F32 tensor (evictable); HOOK holds one whose F32 source does not exist, which
 // only its own consumers may take - a consumer that cannot aborts. Nothing fires below FUSE_MIN_TOKENS or on concurrent streams.
 #include "mmq-fuse.cuh"
 #include "mmq.cuh"
+#include "mmq-q40-mma-geglu.cuh"   // gate + up + GEGLU/SWIGLU + Q8_1 quantize as one GEMM
 #include "mmvq.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"   // ggml_cuda_op_gelu_single, ggml_cuda_op_silu_single
@@ -197,8 +199,8 @@ struct operand_slot {
     int remaining = 0;                          // HOOK slot: consumers still to come
 };
 // hook slots: operands whose F32 source is never written. HOOK_IN holds a pre-norm's or a GEGLU's operand for the matmuls that
-// consume it.
-enum { HOOK_IN = 0, N_HOOKS = 1 };
+// consume it; HOOK_GLU_OUT holds the down-proj operand the fused gate/up GEMM writes while HOOK_IN still holds its input.
+enum { HOOK_IN = 0, HOOK_GLU_OUT = 1, N_HOOKS = 2 };
 struct fuse_state {
     operand_slot plain, hooks[N_HOOKS];
     float * rowscale = nullptr; size_t rowscale_cap = 0;
@@ -284,7 +286,7 @@ static void announce(fuse_state & st, int cc) {
     }
 }
 
-// the two gated units the fused quantizer carries (split form: gate and up as separate tensors);
+// the two gated units the fused quantizer and the fused gate/up GEMM carry (split form: gate and up as separate tensors);
 // SWIGLU_OAI, GEGLU_ERF, GEGLU_QUICK and REGLU are not mirrored and keep the plain path
 static bool glu_op_fusable(const ggml_glu_op op) {
     return op == GGML_GLU_OP_GEGLU || op == GGML_GLU_OP_SWIGLU;
@@ -472,3 +474,64 @@ int ggml_cuda_mmq_fuse_norm(ggml_backend_cuda_context & ctx, const ggml_cgraph *
     return 1;
 }
 
+// gate matmul, up matmul, GLU (GEGLU or SWIGLU, split form), down matmul - the first three as one GEMM whose epilogue writes
+// op(gate)*up quantized straight into the down-proj's operand (mmq-q40-mma-geglu.cu), then the down matmul on it. The gate and
+// up F32 outputs never exist.
+int ggml_cuda_mmq_fuse_gate_up_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * gate = cgraph->nodes[node_idx];
+    const ggml_tensor * up   = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * glu  = cgraph->nodes[node_idx + 2];
+    ggml_tensor *       down = cgraph->nodes[node_idx + 3];
+    if (gate->op != GGML_OP_MUL_MAT || up->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU || down->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+    const ggml_glu_op glu_op = ggml_get_glu_op(glu);
+    const ggml_tensor * x = gate->src[1];
+    if (up->src[1] != x || glu->src[0] != gate || glu->src[1] != up || down->src[1] != glu || !glu_op_fusable(glu_op) ||
+        ((const int32_t *) glu->op_params)[1] != 0 || glu->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    if (gate->src[0]->type != GGML_TYPE_Q4_0 || up->src[0]->type != GGML_TYPE_Q4_0 || !ggml_are_same_shape(gate, up) ||
+        !ggml_are_same_shape(gate, glu) || !ggml_are_same_shape(gate->src[0], up->src[0]) ||
+        (gate->flags & GGML_TENSOR_FLAG_OUTPUT) || (up->flags & GGML_TENSOR_FLAG_OUTPUT) || (glu->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        ggml_node_get_use_count(cgraph, node_idx) != 1 || ggml_node_get_use_count(cgraph, node_idx + 1) != 1 ||
+        ggml_node_get_use_count(cgraph, node_idx + 2) != 1) {
+        return 0;
+    }
+    int cc = 0, cc2 = 0, cc3 = 0;
+    if (!mmq_consumer_ok(gate, x, cc) || !mmq_consumer_ok(up, x, cc2) || !mmq_consumer_ok(down, glu, cc3)) {
+        return 0;
+    }
+    const int64_t K = x->ne[0], M = gate->ne[0], N = x->ne[1];
+    const size_t  smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    if (!ggml_cuda_mmq_q40_mma_glu_supported(glu_op, cc, smpbo, K, M, N)) {
+        return 0;
+    }
+    fuse_state & st = fuse_state_for(ggml_cuda_get_device());
+    if (!hooks_allowed(ctx, st, x)) {
+        return 0;
+    }
+    announce(st, cc);
+    cudaStream_t stream = ctx.stream();
+    // the shared input operand: parked by the pre-norm hook, or quantized here once (both matmuls' shares are taken)
+    const int64_t K_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
+    const size_t  in_bytes = operand_bytes(K_padded, N, 1, 1);
+    const char * y = ggml_cuda_mmq_operand(ctx, GGML_TYPE_Q4_0, x, K, K_padded, N, 1, 1, in_bytes, stream);
+    const char * y2 = ggml_cuda_mmq_operand(ctx, GGML_TYPE_Q4_0, x, K, K_padded, N, 1, 1, in_bytes, stream);
+    GGML_ASSERT(y == y2);
+    // the down operand, written by the fused GEMM into its own slot (the input may still live in HOOK_IN)
+    const int64_t M_padded = GGML_PAD(M, MATRIX_ROW_PADDING);
+    operand_slot & out = st.hooks[HOOK_GLU_OUT];
+    slot_reserve(out, operand_bytes(M_padded, N, 1, 1));
+    ggml_cuda_mmq_q40_mma_glu(glu_op, (const char *) gate->src[0]->data, (const char *) up->src[0]->data, y, out.buf, K, M, N,
+                              gate->src[0]->nb[1], up->src[0]->nb[1], stream);
+    CUDA_CHECK(cudaGetLastError());
+    slot_park(out, cgraph, glu, down->src[0]->type, M_padded, N, 1, 1, /*remaining =*/ 1);
+    st.cur_node = node_idx + 3;
+    ggml_cuda_mul_mat_q(ctx, down->src[0], glu, nullptr, down);
+    GGML_ASSERT(!out.valid);
+    return 3;
+}
