@@ -2,6 +2,8 @@
 #include "mma.cuh"
 
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 
 namespace {
@@ -381,62 +383,96 @@ template <int C, int V, int BLOCKS = 1> bool init(int device) {
     return available[device];
 }
 
-enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head };
+// One tiling of gdn_single: C tokens per chunk, V value columns per block, BLOCKS resident blocks per SM.
+struct gdn_tiling { int C, V, blocks; };
+static bool probe_active = false;  // PROBE, not for deployment
 
-static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a) {
+static bool gdn_mma_eligible(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
     if (!a.eligible || a.H_k != 16 || (a.H != 16 && a.H != 32 && a.H != 48 && a.H != 64) || a.n_tokens < 64 ||
         a.n_tokens > INT64_MAX - 32 || a.rq3 <= 0 || a.n_seqs <= 0 || a.n_seqs > INT_MAX / (a.H * 4)) {
-        return gdn_path::ar;
+        return false;
     }
     const auto & info = ggml_cuda_info().devices[device];
 #ifdef GGML_USE_HIP
-    if (!GGML_CUDA_CC_IS_RDNA3_5(info.cc) || a.n_tokens < 2048) {
-        return gdn_path::ar;
-    }
-    return init<16, 64>(device) ? gdn_path::slice64 : gdn_path::ar;
+    return GGML_CUDA_CC_IS_RDNA3_5(info.cc) && a.n_tokens >= 2048;
 #elif defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(info);
-    return gdn_path::ar;
+    return false;
 #else
     // Enable only architectures benchmarked for this schedule. MMA support alone does not imply a speedup.
-    if (!ampere_mma_available(info.cc) ||
-        (info.cc != GGML_CUDA_CC_AMPERE_GA10X && info.cc != GGML_CUDA_CC_ADA_LOVELACE &&
-         info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK)) {
-        return gdn_path::ar;
+    return ampere_mma_available(info.cc) &&
+           (info.cc == GGML_CUDA_CC_AMPERE_GA10X || info.cc == GGML_CUDA_CC_ADA_LOVELACE ||
+            info.cc == GGML_CUDA_CC_BLACKWELL || info.cc == GGML_CUDA_CC_DGX_SPARK);
+#endif // GGML_USE_HIP
+}
+
+static gdn_tiling select_gdn_tiling(int device, const ggml_cuda_gdn_mma_args & a) {
+#ifdef GGML_USE_HIP
+    GGML_UNUSED_VARS(device, a);
+    return { 16, 64, 1 };
+#else
+    // PROBE, not for deployment: GGML_CUDA_GDN_PROBE="C,V,BLOCKS" forces one tiling so each can be timed.
+    static gdn_tiling probe = { -1, 0, 0 };
+    if (probe.C < 0) {
+        probe.C = 0;
+        if (const char * e = getenv("GGML_CUDA_GDN_PROBE")) {
+            if (sscanf(e, "%d,%d,%d", &probe.C, &probe.V, &probe.blocks) != 3) {
+                probe.C = 0;
+            }
+        }
     }
+    if (probe.C > 0) {
+        probe_active = true;
+        return probe;
+    }
+    const auto & info = ggml_cuda_info().devices[device];
     // Value splitting pays off when whole heads leave at least half the SMs idle.
     if (a.H * a.n_seqs * 2 <= info.nsm) {
         // A grid that already fits in one wave benefits from a larger register budget.
-        if (a.H * a.n_seqs * 4 <= info.nsm) {
-            return init<16, 32, 1>(device) ? gdn_path::slice32_one_block : gdn_path::ar;
-        }
-        return init<16, 32, 2>(device) ? gdn_path::slice32_two_blocks : gdn_path::ar;
+        return { 16, 32, a.H * a.n_seqs * 4 <= info.nsm ? 1 : 2 };
     }
-    return init<16, 128>(device) ? gdn_path::whole_head : gdn_path::ar;
+    return { 16, 128, 1 };
 #endif // GGML_USE_HIP
+}
+
+template <int C, int V, int BLOCKS>
+static bool gdn_launch(int device, const ggml_cuda_gdn_mma_args & a, cudaStream_t stream) {
+    if (!init<C, V, BLOCKS>(device)) {
+        return false;
+    }
+    gdn_single<C, V, BLOCKS><<<a.H * a.n_seqs * (D / V), dim3(32, 8), sizeof(shared<C, V>), stream>>>(a);
+    return true;
 }
 }  // namespace
 
 bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cudaStream_t stream) {
-    if (!a.state_out) {
+    if (!a.state_out || !gdn_mma_eligible(device, a)) {
         return false;
     }
-    const auto path = select_gdn_mma_path(device, a);
-    if (path == gdn_path::ar) {
-        return false;
-    }
+    const gdn_tiling t = select_gdn_tiling(device, a);
+    bool launched = false;
+#define GDN_TILING(C_, V_, B_) \
+    if (t.C == C_ && t.V == V_ && t.blocks == B_) { launched = gdn_launch<C_, V_, B_>(device, a, stream); }
 #ifdef GGML_USE_HIP
-    gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
+    GDN_TILING(16, 64, 1)
 #else
-    if (path == gdn_path::slice32_two_blocks) {
-        gdn_single<16, 32, 2><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
-    } else if (path == gdn_path::slice32_one_block) {
-        gdn_single<16, 32, 1><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
-    } else {
-        gdn_single<16, 128><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<16, 128>), stream>>>(a);
-    }
+    GDN_TILING(16, 128, 1)
+    GDN_TILING(32, 128, 1)
+    GDN_TILING(64, 128, 1)
+    GDN_TILING(16, 64, 2)
+    GDN_TILING(32, 64, 2)
+    GDN_TILING(16, 32, 1)
+    GDN_TILING(16, 32, 2)
+    GDN_TILING(32, 32, 2)
 #endif // GGML_USE_HIP
+#undef GDN_TILING
+    if (!launched) {
+        if (probe_active) {
+            fprintf(stderr, "gdn probe: tiling %d,%d,%d unavailable on this device, autoregressive path used\n", t.C, t.V, t.blocks);
+        }
+        return false;
+    }
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
