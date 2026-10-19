@@ -382,7 +382,7 @@ template <int C, int V, int BLOCKS = 1> bool init(int device) {
     return available[device];
 }
 
-enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head };
+enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head, chunk32, chunk64 };
 
 static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
@@ -415,6 +415,8 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
             case 2: return init<16, 64>(device)    ? gdn_path::slice64            : gdn_path::ar;
             case 3: return init<16, 32, 1>(device) ? gdn_path::slice32_one_block  : gdn_path::ar;
             case 4: return init<16, 32, 2>(device) ? gdn_path::slice32_two_blocks : gdn_path::ar;
+            case 6: return init<32, 128>(device)   ? gdn_path::chunk32            : gdn_path::ar;
+            case 7: return init<64, 128>(device)   ? gdn_path::chunk64            : gdn_path::ar;
             default: return gdn_path::ar;
         }
     }
@@ -446,6 +448,10 @@ bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cuda
         gdn_single<16, 32, 2><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
     } else if (path == gdn_path::slice64) {
         gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
+    } else if (path == gdn_path::chunk32) {
+        gdn_single<32, 128><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<32, 128>), stream>>>(a);
+    } else if (path == gdn_path::chunk64) {
+        gdn_single<64, 128><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<64, 128>), stream>>>(a);
     } else if (path == gdn_path::slice32_one_block) {
         gdn_single<16, 32, 1><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
     } else {
