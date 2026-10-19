@@ -4519,6 +4519,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_MUL_MAT) {
         const int n_extra_gu = ggml_cuda_mmq_fuse_gate_up_glu(*cuda_ctx, cgraph, i);
         if (n_extra_gu > 0) {
+            if (getenv("GGML_CUDA_MMADD_DEBUG") && i + n_extra_gu + 1 < cgraph->n_nodes) fprintf(stderr, "mmadd: gate/up/glu/down hook consumed %s; next node %s (%s)\n", cgraph->nodes[i + n_extra_gu]->name, cgraph->nodes[i + n_extra_gu + 1]->name, ggml_op_name(cgraph->nodes[i + n_extra_gu + 1]->op));   // PROBE
             return n_extra_gu;
         }
     }
@@ -4544,18 +4545,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // a dense Q4_0/Q8_0 matmul whose only reader is a same-shape ADD (the residual): the INT8-MMA GEMM writes the ADD's output with
     // the other operand added in its epilogue (mmq.cu); the separate ADD kernel's read-modify-write of the output goes away
     if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_ADD) {
+        static const bool dbg = getenv("GGML_CUDA_MMADD_DEBUG") != nullptr;   // PROBE
         ggml_tensor *       add   = cgraph->nodes[i + 1];
         const ggml_tensor * other = add->src[0] == node ? add->src[1] : (add->src[1] == node ? add->src[0] : nullptr);
-        if (other && other != node && add->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 &&
-            ggml_are_same_shape(add, node) && ggml_are_same_shape(other, node) && ggml_is_contiguous(add) && ggml_is_contiguous(other) &&
-            ggml_node_get_use_count(cgraph, i) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
-            ((uintptr_t) add->data & 15) == 0 && ((uintptr_t) other->data & 15) == 0 && (other->nb[1] & 15) == 0 && (add->nb[1] & 15) == 0 &&
-            ggml_cuda_mul_mat_add_fusable(*cuda_ctx, node)) {
-            const int out_nodes[] = { i + 1 };
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
-                ggml_cuda_mul_mat_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, add);
-                return 1;
-            }
+        const char * why = nullptr;
+        if (!other || other == node) why = "add not of this matmul";
+        else if (add->type != GGML_TYPE_F32 || other->type != GGML_TYPE_F32) why = "types";
+        else if (!ggml_are_same_shape(add, node) || !ggml_are_same_shape(other, node)) why = "shapes";
+        else if (!ggml_is_contiguous(add) || !ggml_is_contiguous(other)) why = "contiguity";
+        else if (ggml_node_get_use_count(cgraph, i) != 1) why = "matmul has other readers";
+        else if (node->flags & GGML_TENSOR_FLAG_OUTPUT) why = "matmul is an output";
+        else if (((uintptr_t) add->data & 15) || ((uintptr_t) other->data & 15) || (other->nb[1] & 15) || (add->nb[1] & 15)) why = "alignment";
+        else if (!ggml_cuda_mul_mat_add_fusable(*cuda_ctx, node)) why = "not the INT8-MMA path";
+        else { const int out_nodes[] = { i + 1 }; if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) why = "memory ranges"; }
+        if (dbg) fprintf(stderr, "mmadd: %s -> %s (other %s): %s\n", node->name, add->name, other ? other->name : "?", why ? why : "FUSED");
+        if (!why) {
+            ggml_cuda_mul_mat_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, add);
+            return 1;
         }
     }
 
