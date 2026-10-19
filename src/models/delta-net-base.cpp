@@ -601,3 +601,53 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     return output;
 }
+
+ggml_tensor * llm_build_delta_net_base::build_conv_output(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        conv_states_all,
+        ggml_tensor *        qkv_mixed,
+        ggml_tensor *        conv_kernel,
+        int64_t              conv_channels,
+        int                  il) {
+    const int64_t conv_kernel_size = conv_kernel->ne[0];
+    const int64_t n_seqs           = ubatch.n_seqs;
+    const int64_t n_seq_tokens     = ubatch.n_seq_tokens;
+
+    // the rollback-split form keeps K state snapshots and the short batch has no full window: both take the concat path
+    if (!cparams.ssm_conv_tm || cparams.n_rs_seq != 0 || n_seq_tokens < conv_kernel_size - 1) {
+        ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+        return ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    }
+
+    const auto * mctx_cur = inp->mctx;
+    const auto   kv_head  = mctx_cur->get_head();
+
+    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
+    cb(conv_states, "conv_states_reshaped", il);
+
+    // the projection output as written: [channels, n_seq_tokens, n_seqs] - no transpose, no concat
+    ggml_tensor * x = ggml_reshape_3d(ctx0, qkv_mixed, conv_channels, n_seq_tokens, n_seqs);
+
+    ggml_tensor * out = ggml_ssm_conv_tm(ctx0, x, conv_states, conv_kernel);
+    cb(out, "conv_output_raw", il);
+    res->add_fused_node({LLM_FUSED_OP_SSM_CONV_TM, out, il});
+
+    // the new state: the last (kernel - 1) tokens, into the cache's [taps, channels] layout
+    const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
+    const size_t  row_size  = ggml_row_size(conv_states_all->type, row_count);
+
+    ggml_tensor * last = ggml_view_3d(ctx0, x, conv_channels, conv_kernel_size - 1, n_seqs,
+            x->nb[1], x->nb[2], (n_seq_tokens - (conv_kernel_size - 1)) * x->nb[1]);
+    ggml_tensor * last_t = ggml_transpose(ctx0, last);   // [kernel - 1, channels, n_seqs], strided
+    cb(last_t, "conv_state_last", il);
+
+    ggml_tensor * conv_state_update = ggml_view_2d(ctx0, conv_states_all, row_count, n_seqs, conv_states_all->nb[1],
+            kv_head * row_size);
+    cb(conv_state_update, "conv_state_update", il);
+
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_t, conv_state_update));
+
+    return out;
+}
+

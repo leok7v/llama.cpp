@@ -86,6 +86,16 @@ struct llm_build_delta_net_base : public llm_graph_context {
             int64_t              conv_channels,
             int                  il);
 
+    // the conv output itself: over the token-major projection with the state kept apart (ggml_ssm_conv_tm) when the
+    // backend has it and the batch allows, else build_conv_state + ggml_ssm_conv; writes the new state back either way
+    ggml_tensor * build_conv_output(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        conv_states_all,
+            ggml_tensor *        qkv_mixed,
+            ggml_tensor *        conv_kernel,
+            int64_t              conv_channels,
+            int                  il);
+
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
     ggml_tensor * build_recurrent_attn(

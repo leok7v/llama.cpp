@@ -4682,6 +4682,32 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+// GGML_OP_SSM_CONV_TM
+struct test_ssm_conv_tm : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne_x;   // [d_inner, n_t, n_s, 1]
+    const std::array<int64_t, 4> ne_s;   // [d_conv-1, d_inner, n_s, 1]
+    const std::array<int64_t, 4> ne_c;   // [d_conv, d_inner, 1, 1]
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, ne_x, ne_s, ne_c);
+    }
+
+    test_ssm_conv_tm(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne_x = {128, 10, 1, 1},
+            std::array<int64_t, 4> ne_s = {3, 128, 1, 1},
+            std::array<int64_t, 4> ne_c = {4, 128, 1, 1})
+        : type(type), ne_x(ne_x), ne_s(ne_s), ne_c(ne_c) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x   = ggml_new_tensor(ctx, type, 4, ne_x.data());
+        ggml_tensor * s   = ggml_new_tensor(ctx, type, 4, ne_s.data());
+        ggml_tensor * c   = ggml_new_tensor(ctx, type, 4, ne_c.data());
+        ggml_tensor * out = ggml_ssm_conv_tm(ctx, x, s, c);
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -10903,6 +10929,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // long token (n_t > 32, exercises the long_token kernel path)
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+            // the token-major form: the window edge (n_t = d_conv - 1), one and four sequences, a token count off the 32-block grid
+            test_cases.emplace_back(new test_ssm_conv_tm(GGML_TYPE_F32, {d_inner, d_conv - 1, 1, 1}, {d_conv - 1, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
+            test_cases.emplace_back(new test_ssm_conv_tm(GGML_TYPE_F32, {d_inner, 64, 1, 1},         {d_conv - 1, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
+            test_cases.emplace_back(new test_ssm_conv_tm(GGML_TYPE_F32, {d_inner, 37, 4, 1},         {d_conv - 1, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
         }
     }
 

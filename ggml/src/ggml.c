@@ -1082,6 +1082,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
+    "SSM_CONV_TM",
     "WIN_PART",
     "WIN_UNPART",
     "GET_REL_POS",
@@ -1113,7 +1114,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1198,6 +1199,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
+    "ssm_conv_tm(x)",
     "win_part(x)",
     "win_unpart(x)",
     "get_rel_pos(x)",
@@ -1229,7 +1231,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5702,6 +5704,35 @@ struct ggml_tensor * ggml_ssm_conv(
     result->op     = GGML_OP_SSM_CONV;
     result->src[0] = sx;
     result->src[1] = c;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_ssm_conv_tm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * s,
+        struct ggml_tensor  * c) {
+    GGML_ASSERT(ggml_is_3d(x));
+    GGML_ASSERT(ggml_is_3d(s));
+    GGML_ASSERT(ggml_is_matrix(c));
+
+    const int64_t d_conv  = c->ne[0];
+    const int64_t d_inner = c->ne[1];
+    const int64_t n_t     = x->ne[1];
+    const int64_t n_s     = x->ne[2];
+
+    GGML_ASSERT(x->ne[0] == d_inner);
+    GGML_ASSERT(s->ne[0] == d_conv - 1);
+    GGML_ASSERT(s->ne[1] == d_inner);
+    GGML_ASSERT(s->ne[2] == n_s);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, n_t, n_s);
+
+    result->op     = GGML_OP_SSM_CONV_TM;
+    result->src[0] = x;
+    result->src[1] = c;
+    result->src[2] = s;
 
     return result;
 }

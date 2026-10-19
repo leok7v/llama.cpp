@@ -572,6 +572,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
+        GGML_OP_SSM_CONV_TM,
         GGML_OP_WIN_PART,
         GGML_OP_WIN_UNPART,
         GGML_OP_GET_REL_POS,
@@ -2530,6 +2531,14 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,
+            struct ggml_tensor  * c);
+
+    // the same convolution over a token-major input: x [d_inner, n_t, n_s] as a projection writes it, the carried
+    // state s [d_conv-1, d_inner, n_s] kept apart; equals ggml_ssm_conv(concat(s, transpose(x)), c) -> [d_inner, n_t, n_s]
+    GGML_API struct ggml_tensor * ggml_ssm_conv_tm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * s,
             struct ggml_tensor  * c);
 
     GGML_API struct ggml_tensor * ggml_ssm_scan(
