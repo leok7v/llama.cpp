@@ -19,7 +19,9 @@ const char * ggml_cuda_mmq_operand(ggml_backend_cuda_context & ctx, ggml_type ty
 int  ggml_cuda_mmq_fuse_glu (ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
 int  ggml_cuda_mmq_fuse_norm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
 // gate matmul + up matmul + GEGLU as one GEMM writing the down-proj operand, then the down matmul; returns 3 or 0.
-int  ggml_cuda_mmq_fuse_gate_up_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+// fused_add (nullable): the same-shape ADD right after the down matmul, folded into its INT8-MMA epilogue (the dispatcher checks
+// eligibility and memory ranges first); the return grows by one for the ADD
+int  ggml_cuda_mmq_fuse_gate_up_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx, const ggml_tensor * fused_add = nullptr);
 // RMS_NORM over heads + weight MUL + MUL(SILU(z)) [+ RESHAPE] feeding one MMQ matmul: armed at the RMS_NORM (returns 1, the weight
 // MUL goes with it), fired at the SILU (returns the nodes consumed after it: the MUL and, if present, the RESHAPE)
 int  ggml_cuda_mmq_fuse_norm_gated_arm (ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
