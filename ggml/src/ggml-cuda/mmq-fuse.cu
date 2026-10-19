@@ -10,6 +10,7 @@
 #include "mmvq.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"   // ggml_cuda_op_gelu_single, ggml_cuda_op_silu_single
+#include "ggml-backend.h"   // ggml_backend_buffer_get_alloc_size
 
 #include <algorithm>
 #include <cstring>
@@ -638,6 +639,20 @@ int ggml_cuda_mmq_fuse_norm_gated_arm(ggml_backend_cuda_context & ctx, const ggm
     int cc = 0;
     if (operand->ne[0] != hd * H || operand->ne[1] != T || !mmq_consumer_ok(mm, operand, cc)) {
         return 0;
+    }
+    // the fire reads x again, after every node between here and the SILU has run; the allocator may have handed x's memory
+    // (dead after this norm as far as the graph knows) to one of them. Stay plain when any of them writes into x.
+    for (int k = node_idx + 2; k < j - 1; ++k) {
+        const ggml_tensor * c = cgraph->nodes[k];
+        if (c->op == GGML_OP_VIEW || c->op == GGML_OP_RESHAPE || c->op == GGML_OP_PERMUTE || c->op == GGML_OP_TRANSPOSE ||
+            c->op == GGML_OP_NONE || c->data == nullptr || c->buffer == nullptr) {
+            continue;   // a view writes nothing of its own
+        }
+        const uintptr_t xs = (uintptr_t) x->data, xe = xs + ggml_backend_buffer_get_alloc_size(x->buffer, x);
+        const uintptr_t cs = (uintptr_t) c->data, ce = cs + ggml_backend_buffer_get_alloc_size(c->buffer, c);
+        if (cs < xe && xs < ce) {
+            return 0;
+        }
     }
     fuse_state & st = fuse_state_for(ggml_cuda_get_device());
     // nothing is parked here (only row scales are written), so a pre-norm operand still waiting for the gate's own matmul
