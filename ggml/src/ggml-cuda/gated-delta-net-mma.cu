@@ -2,6 +2,7 @@
 #include "mma.cuh"
 
 #include <climits>
+#include <cstdlib>
 #include <mutex>
 
 namespace {
@@ -405,6 +406,18 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
          info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK)) {
         return gdn_path::ar;
     }
+    // EXPERIMENT (branch GDN-TUNE, never shipped): GGML_CUDA_GDN_PATH picks the schedule by hand so each can be
+    // timed on one build - 1 whole head, 2 V=64 slices, 3 V=32 slices one block/SM, 4 V=32 slices two blocks/SM, 5 the
+    // scalar path. The measured answer replaces this with a rule.
+    if (const char * force = getenv("GGML_CUDA_GDN_PATH")) {
+        switch (atoi(force)) {
+            case 1: return init<16, 128>(device)   ? gdn_path::whole_head         : gdn_path::ar;
+            case 2: return init<16, 64>(device)    ? gdn_path::slice64            : gdn_path::ar;
+            case 3: return init<16, 32, 1>(device) ? gdn_path::slice32_one_block  : gdn_path::ar;
+            case 4: return init<16, 32, 2>(device) ? gdn_path::slice32_two_blocks : gdn_path::ar;
+            default: return gdn_path::ar;
+        }
+    }
     // Value splitting pays off when whole heads leave at least half the SMs idle.
     if (a.H * a.n_seqs * 2 <= info.nsm) {
         // A grid that already fits in one wave benefits from a larger register budget.
@@ -431,6 +444,8 @@ bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cuda
 #else
     if (path == gdn_path::slice32_two_blocks) {
         gdn_single<16, 32, 2><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
+    } else if (path == gdn_path::slice64) {
+        gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
     } else if (path == gdn_path::slice32_one_block) {
         gdn_single<16, 32, 1><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
     } else {
