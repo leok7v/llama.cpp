@@ -42,6 +42,8 @@ struct llama_cparams {
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
+    bool ssm_conv_tm;        // the delta-net conv over the token-major projection output, state kept apart
+    bool auto_sctm;
     bool fused_lid;          // use fused lightning indexer
     bool auto_flid;
     bool fused_dsv4_hc_pre;
