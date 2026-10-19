@@ -141,6 +141,12 @@ static const llm_fused_op_probe llm_fused_op_gdn_ch_probe = {
     /*.n_tokens_per_seq =*/ 16,
 };
 
+static const llm_fused_op_probe llm_fused_op_ssm_conv_tm_probe = {
+    /*.op               =*/ LLM_FUSED_OP_SSM_CONV_TM,
+    /*.name             =*/ "token-major SSM conv",
+    /*.n_tokens_per_seq =*/ 16,
+};
+
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
     /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER,
     /*.name             =*/ "Lightning Indexer",
@@ -325,6 +331,9 @@ llama_context::llama_context(
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
+
+    cparams.ssm_conv_tm = true;
+    cparams.auto_sctm   = true;
 
     cparams.fused_lid = true;
     cparams.auto_flid = false;
@@ -666,6 +675,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_gdn_ar_probe, cparams.fused_gdn_ar);
         resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch);
         cparams.auto_fgdn = false;
+    }
+
+    if (cparams.auto_sctm) {
+        LLAMA_LOG_INFO("%s: resolving token-major SSM conv support:\n", func);
+        resolve(llm_fused_op_ssm_conv_tm_probe, cparams.ssm_conv_tm);
+        cparams.auto_sctm = false;
     }
 
     if (cparams.auto_flid) {

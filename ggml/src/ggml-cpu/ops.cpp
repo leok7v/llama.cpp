@@ -12609,3 +12609,65 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+// ggml_compute_forward_ssm_conv_tm: the conv over a token-major input with the carried state kept apart
+
+static void ggml_compute_forward_ssm_conv_tm_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0]; // x      [d_inner, n_t, n_s]
+    const ggml_tensor * src1 = dst->src[1]; // conv1d.weight [d_conv, d_inner]
+    const ggml_tensor * src2 = dst->src[2]; // state  [d_conv-1, d_inner, n_s]
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int nc  = src1->ne[0]; // d_conv
+    const int nr  = src0->ne[0]; // d_inner
+    const int n_t = src0->ne[1]; // tokens per sequence
+    const int n_s = src0->ne[2]; // sequences
+
+    GGML_ASSERT( dst->ne[0] == nr && dst->ne[1] == n_t && dst->ne[2] == n_s);
+    GGML_ASSERT(src2->ne[0] == nc - 1 && src2->ne[1] == nr && src2->ne[2] == n_s);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
+    GGML_ASSERT(src2->nb[0] == sizeof(float));
+
+    const int dr  = (nr + nth - 1)/nth;
+    const int ir0 = dr*ith;
+    const int ir1 = MIN(ir0 + dr, nr);
+
+    for (int i3 = 0; i3 < n_s; ++i3) {
+        for (int i2 = 0; i2 < n_t; ++i2) {
+            float * y = (float *) ((char *) dst->data + i2*dst->nb[1] + i3*dst->nb[2]);
+            for (int i1 = ir0; i1 < ir1; ++i1) {
+                const float * c = (const float *) ((const char *) src1->data + i1*src1->nb[1]);
+                const float * s = (const float *) ((const char *) src2->data + i1*src2->nb[1] + i3*src2->nb[2]);
+                float sumf = 0.0f;
+                for (int i0 = 0; i0 < nc; ++i0) {
+                    const int t = i2 + i0 - (nc - 1);
+                    const float v = t < 0 ? s[t + nc - 1]
+                                          : *(const float *) ((const char *) src0->data + i1*src0->nb[0] + t*src0->nb[1] + i3*src0->nb[2]);
+                    sumf += v * c[i0];
+                }
+                y[i1] = sumf;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_ssm_conv_tm(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_ssm_conv_tm_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
