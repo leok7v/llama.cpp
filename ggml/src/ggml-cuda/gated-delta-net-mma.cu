@@ -123,7 +123,7 @@ template <int R, int C> __device__ __forceinline__ void store(matrix<R, C> & m, 
 
 // Each block owns V independent value columns and advances by C tokens.
 // Keep recurrent state in FP32; pack high/residual BF16 operands inside the block.
-template <int C, int V, int BLOCKS = 1>
+template <int C, int V, int BLOCKS = 1, bool IL = false>
 static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_mma_args a) {
 #if defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
     static_assert(ggml_cuda_get_physical_warp_size() == 32, "GDN MMA requires 32-lane warps");
@@ -237,6 +237,46 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 if (warp < 4) {
                     return;
                 }
+            }
+            if constexpr (IL && V != 32 && C == 16) {
+                // Interleaved: the warp's tiles advance through the k-steps together, so the 24-deep MMA chain of one
+                // tile hides behind the others', and the Q/K A-tiles of a k-step are loaded once for all of them (C=16:
+                // every tile of the warp sits in the one 16-row group). Per tile the accumulation order is unchanged.
+                constexpr int T = (C / 16) * (V / N) / WARPS;
+                static_assert(T >= 1, "a projection tile per warp");
+                acc qs[T], ks[T];
+#pragma unroll
+                for (int k = 0; k < D; k += 16) {
+                    const auto qh = load<a_tile, false>(s.q, 0, k, false);
+                    const auto ql = load<a_tile, false>(s.q, 0, k, true);
+                    const auto kh = load<a_tile, false>(s.k, 0, k, false);
+                    const auto kl = load<a_tile, false>(s.k, 0, k, true);
+#pragma unroll
+                    for (int j = 0; j < T; ++j) {
+                        const int  c  = ((warp + j * WARPS) % (V / N)) * N;
+                        const auto bh = load<b_tile, true>(s.scratch.state, c, k, false);
+                        const auto bl = load<b_tile, true>(s.scratch.state, c, k, true);
+                        mma(qs[j], ql, bh);
+                        mma(qs[j], qh, bl);
+                        mma(qs[j], qh, bh);
+                        mma(ks[j], kl, bh);
+                        mma(ks[j], kh, bl);
+                        mma(ks[j], kh, bh);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < T; ++j) {
+                    const int c = ((warp + j * WARPS) % (V / N)) * N;
+#pragma unroll
+                    for (int i = 0; i < acc::ne; ++i) {
+                        const int   t = acc::get_i(i), v = c + acc::get_j(i);
+                        const float decay = expf(s.prefix[t]);
+                        const float vv    = t < valid ? a.v[voff + (t0 + t) * a.sv2 + v] : 0.f;
+                        s.delta.store(t, v, s.beta[t] * (vv - decay * ks[j].x[i]));
+                        base_output[j].x[i] = decay * qs[j].x[i];
+                    }
+                }
+                return;
             }
             for (int ti = (V == 32 ? warp - 4 : warp); ti < (C / 16) * (V / N); ti += (V == 32 ? 4 : WARPS)) {
                 const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
@@ -364,7 +404,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
 #endif // defined(AMPERE_MMA_AVAILABLE) || (defined(AMD_WMMA_AVAILABLE) && defined(RDNA3))
 }
 
-template <int C, int V, int BLOCKS = 1> bool init(int device) {
+template <int C, int V, int BLOCKS = 1, bool IL = false> bool init(int device) {
     static std::once_flag once[GGML_CUDA_MAX_DEVICES];
     static bool           available[GGML_CUDA_MAX_DEVICES] = {};
     std::call_once(once[device], [device] {
@@ -376,7 +416,7 @@ template <int C, int V, int BLOCKS = 1> bool init(int device) {
         if (sizeof(shared<C, V>) > ggml_cuda_info().devices[device].smpbo) {
             return;
         }
-        const auto status = cudaFuncSetAttribute((const void *) gdn_single<C, V, BLOCKS>,
+        const auto status = cudaFuncSetAttribute((const void *) gdn_single<C, V, BLOCKS, IL>,
                                                  cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(shared<C, V>));
         available[device] = status == cudaSuccess;
         if (status != cudaSuccess) {
@@ -386,7 +426,7 @@ template <int C, int V, int BLOCKS = 1> bool init(int device) {
     return available[device];
 }
 
-enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head, chunk32, chunk64, chunk32_slice64, chunk32_slice32 };
+enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head, chunk32, chunk64, chunk32_slice64, chunk32_slice32, whole_head_il, slice64_il };
 
 static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
@@ -423,6 +463,8 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
             case 7: return init<64, 128>(device)   ? gdn_path::chunk64            : gdn_path::ar;
             case 8: return init<32, 64>(device)    ? gdn_path::chunk32_slice64    : gdn_path::ar;
             case 9: return init<32, 32, 2>(device) ? gdn_path::chunk32_slice32    : gdn_path::ar;
+            case 11: return init<16, 128, 1, true>(device) ? gdn_path::whole_head_il : gdn_path::ar;
+            case 12: return init<16, 64, 1, true>(device)  ? gdn_path::slice64_il    : gdn_path::ar;
             default: return gdn_path::ar;
         }
     }
@@ -458,6 +500,10 @@ bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cuda
         gdn_single<32, 128><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<32, 128>), stream>>>(a);
     } else if (path == gdn_path::chunk64) {
         gdn_single<64, 128><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<64, 128>), stream>>>(a);
+    } else if (path == gdn_path::whole_head_il) {
+        gdn_single<16, 128, 1, true><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<16, 128>), stream>>>(a);
+    } else if (path == gdn_path::slice64_il) {
+        gdn_single<16, 64, 1, true><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
     } else if (path == gdn_path::chunk32_slice64) {
         gdn_single<32, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<32, 64>), stream>>>(a);
     } else if (path == gdn_path::chunk32_slice32) {
