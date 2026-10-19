@@ -514,7 +514,7 @@ int ggml_cuda_mmq_fuse_norm(ggml_backend_cuda_context & ctx, const ggml_cgraph *
 // gate matmul, up matmul, GLU (GEGLU or SWIGLU, split form), down matmul - the first three as one GEMM whose epilogue writes
 // op(gate)*up quantized straight into the down-proj's operand (mmq-q40-mma-geglu.cu), then the down matmul on it. The gate and
 // up F32 outputs never exist.
-int ggml_cuda_mmq_fuse_gate_up_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+int ggml_cuda_mmq_fuse_gate_up_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx, const ggml_tensor * fused_add) {
     if (node_idx + 3 >= cgraph->n_nodes) {
         return 0;
     }
@@ -568,9 +568,9 @@ int ggml_cuda_mmq_fuse_gate_up_glu(ggml_backend_cuda_context & ctx, const ggml_c
     CUDA_CHECK(cudaGetLastError());
     slot_park(out, cgraph, glu, down->src[0]->type, M_padded, N, 1, 1, /*remaining =*/ 1);
     st.cur_node = node_idx + 3;
-    ggml_cuda_mul_mat_q(ctx, down->src[0], glu, nullptr, down);
+    ggml_cuda_mul_mat_q(ctx, down->src[0], glu, nullptr, down, fused_add);
     GGML_ASSERT(!out.valid);
-    return 3;
+    return fused_add ? 4 : 3;
 }
 
 // RMS_NORM over hd-wide heads -> MUL(w) -> MUL(SILU(z)) [-> RESHAPE] -> one MMQ matmul (a gated output norm before a projection).

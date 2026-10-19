@@ -4563,7 +4563,26 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
     if (node->op == GGML_OP_MUL_MAT) {
-        const int n_extra_gu = ggml_cuda_mmq_fuse_gate_up_glu(*cuda_ctx, cgraph, i);
+        // the residual ADD behind the down matmul of a gate/up/GLU/down group rides into the down GEMM's epilogue when it is
+        // the down's only reader, has its shape, and the down takes the INT8-MMA path; the hook tells us nothing else, so the
+        // pattern is checked here and the hook only receives the ADD
+        const ggml_tensor * fused_add = nullptr;
+        if (i + 4 < cgraph->n_nodes && cgraph->nodes[i + 3]->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 4]->op == GGML_OP_ADD) {
+            ggml_tensor *       down  = cgraph->nodes[i + 3];
+            ggml_tensor *       add   = cgraph->nodes[i + 4];
+            const ggml_tensor * other = add->src[0] == down ? add->src[1] : (add->src[1] == down ? add->src[0] : nullptr);
+            if (other && other != down && add->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 &&
+                ggml_are_same_shape(add, down) && ggml_are_same_shape(other, down) && ggml_is_contiguous(add) && ggml_is_contiguous(other) &&
+                ggml_node_get_use_count(cgraph, i + 3) == 1 && !(down->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                ((uintptr_t) add->data & 15) == 0 && ((uintptr_t) other->data & 15) == 0 && (other->nb[1] & 15) == 0 && (add->nb[1] & 15) == 0 &&
+                ggml_cuda_mul_mat_add_fusable(*cuda_ctx, down)) {
+                const int out_nodes[] = { i + 4 };
+                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i + 3, 2, out_nodes, 1)) {
+                    fused_add = add;
+                }
+            }
+        }
+        const int n_extra_gu = ggml_cuda_mmq_fuse_gate_up_glu(*cuda_ctx, cgraph, i, fused_add);
         if (n_extra_gu > 0) {
             return n_extra_gu;
         }
