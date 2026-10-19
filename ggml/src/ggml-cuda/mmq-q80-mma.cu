@@ -76,7 +76,8 @@ template <int BM, int BN, int WN, int NSA, int NSB, int NW> struct cfg {
 template <int BM, int BN, int WN, int NSA, int NSB, int NW, bool BPF = true, bool RESIDENT = false, int MINB = 1>
 __global__ void __launch_bounds__(32*NW, MINB) q8_0_q8_1_gemm_tma(
         const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
-        float * __restrict__ dst, const int M, const int N, const int K, const int64_t stride_dst) {
+        float * __restrict__ dst, const int M, const int N, const int K, const int64_t stride_dst,
+        const float * __restrict__ res, const int64_t stride_res) {
     using namespace q8k;
     using C = cfg<BM, BN, WN, NSA, NSB, NW>;
     constexpr int NT = 32*NW;
@@ -271,7 +272,12 @@ __global__ void __launch_bounds__(32*NW, MINB) q8_0_q8_1_gemm_tma(
         for (int idx = tid; idx < BNH*(BM/4); idx += NT) {
             const int col = idx / (BM/4), q = idx - col*(BM/4);
             if (j_base + h + col < N) {
-                *(float4 *) (dst + (size_t) (j_base + h + col)*stride_dst + i_base + 4*q) = *(const float4 *) (Cst + col*CS + 4*q);
+                float4 v = *(const float4 *) (Cst + col*CS + 4*q);
+                if (res) {   // the residual ADD that follows the matmul, folded in: the same fp32 sum the separate kernel makes
+                    const float4 r = *(const float4 *) (res + (size_t) (j_base + h + col)*stride_res + i_base + 4*q);
+                    v.x += r.x; v.y += r.y; v.z += r.z; v.w += r.w;
+                }
+                *(float4 *) (dst + (size_t) (j_base + h + col)*stride_dst + i_base + 4*q) = v;
             }
         }
     }
@@ -343,7 +349,8 @@ bool ggml_cuda_mmq_q80_mma_supported(const int cc, const size_t smpbo, const int
 }
 
 void ggml_cuda_mmq_q80_mma(const char * x, const char * y, float * dst,
-                           const int64_t ne00, const int64_t ne01, const int64_t ne11, const int64_t stride_dst, const int64_t nb01, cudaStream_t stream) {
+                           const int64_t ne00, const int64_t ne01, const int64_t ne11, const int64_t stride_dst, const int64_t nb01,
+                           const float * res, const int64_t stride_res, cudaStream_t stream) {
     GGML_ASSERT(ne00 % (2*q8k::BK) == 0 && ne01 % Q80MMA_BM == 0 && ne11 >= 1);
     GGML_ASSERT(((uintptr_t) x) % 16 == 0 && ((uintptr_t) y) % 16 == 0 && nb01 % 16 == 0);
     CUtensorMap tmA, tmB;
@@ -365,7 +372,7 @@ void ggml_cuda_mmq_q80_mma(const char * x, const char * y, float * dst,
     CUDA_SET_SHARED_MEMORY_LIMIT((q8_0_q8_1_gemm_tma<Q80MMA_BM, Q80MMA_BN, Q80MMA_WN, Q80MMA_NSA, Q80MMA_NSB, Q80MMA_NW>), Q80MMA_CFG::SMEM);
     const int grid = (int) ((ne01/Q80MMA_BM) * ((ne11 + Q80MMA_BN - 1)/Q80MMA_BN));
     q8_0_q8_1_gemm_tma<Q80MMA_BM, Q80MMA_BN, Q80MMA_WN, Q80MMA_NSA, Q80MMA_NSB, Q80MMA_NW><<<grid, 32*Q80MMA_NW, Q80MMA_CFG::SMEM, stream>>>
-        (tmA, tmB, dst, (int) ne01, (int) ne11, (int) ne00, stride_dst);
+        (tmA, tmB, dst, (int) ne01, (int) ne11, (int) ne00, stride_dst, res, stride_res);
     CUDA_CHECK(cudaGetLastError());
 }
 #else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

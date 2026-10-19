@@ -62,6 +62,8 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/mmq-q40-mma.cuh"
+#include "ggml-cuda/mmq-q80-mma.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -3774,6 +3776,28 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// a dense Q4_0/Q8_0 matmul that ggml_cuda_mul_mat hands to the INT8-MMA GEMMs of mmq.cu - the one path whose epilogue can add a residual
+static bool ggml_cuda_mul_mat_add_fusable(ggml_backend_cuda_context & ctx, const ggml_tensor * mm) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if ((src0->type != GGML_TYPE_Q4_0 && src0->type != GGML_TYPE_Q8_0) || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+        mm->src[2] != nullptr || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src0->view_src != nullptr ||
+        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(mm)) {
+        return false;
+    }
+    const int    cc        = ggml_cuda_info().devices[ctx.device].cc;
+    const int    warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+    const size_t smpbo     = ggml_cuda_info().devices[ctx.device].smpbo;
+    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1], ne11 = src1->ne[1];
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11) ||
+        ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false) ||
+        ggml_cuda_should_use_mmvq(src0->type, cc, ne11) || !ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        return false;
+    }
+    return src0->type == GGML_TYPE_Q4_0 ? ggml_cuda_mmq_q40_mma_supported(cc, smpbo, ne00, ne01, ne11)
+                                        : ggml_cuda_mmq_q80_mma_supported(cc, smpbo, ne00, ne01, ne11);
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4560,6 +4584,24 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n_extra_g = ggml_cuda_mmq_fuse_norm_gated_fire(*cuda_ctx, cgraph, i);
         if (n_extra_g > 0) {
             return n_extra_g;
+        }
+    }
+
+    // a dense Q4_0/Q8_0 matmul whose only reader is a same-shape ADD (the residual): the INT8-MMA GEMM writes the ADD's output with
+    // the other operand added in its epilogue (mmq.cu); the separate ADD kernel's read-modify-write of the output goes away
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_ADD) {
+        ggml_tensor *       add   = cgraph->nodes[i + 1];
+        const ggml_tensor * other = add->src[0] == node ? add->src[1] : (add->src[1] == node ? add->src[0] : nullptr);
+        if (other && other != node && add->type == GGML_TYPE_F32 && other->type == GGML_TYPE_F32 &&
+            ggml_are_same_shape(add, node) && ggml_are_same_shape(other, node) && ggml_is_contiguous(add) && ggml_is_contiguous(other) &&
+            ggml_node_get_use_count(cgraph, i) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ((uintptr_t) add->data & 15) == 0 && ((uintptr_t) other->data & 15) == 0 && (other->nb[1] & 15) == 0 && (add->nb[1] & 15) == 0 &&
+            ggml_cuda_mul_mat_add_fusable(*cuda_ctx, node)) {
+            const int out_nodes[] = { i + 1 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+                ggml_cuda_mul_mat_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, add);
+                return 1;
+            }
         }
     }
 

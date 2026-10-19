@@ -135,7 +135,9 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_tensor * fused_add) {
+    GGML_ASSERT(!fused_add || (fused_add->op == GGML_OP_ADD && (fused_add->src[0] == dst || fused_add->src[1] == dst)));
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -273,9 +275,21 @@ void ggml_cuda_mul_mat_q(
         // Q4_0 with a batch of tokens on Blackwell: the exact INT8-MMA kernel (mmq-q40-mma.cu) takes the GEMM in MMQ's place
         // when the shape qualifies; it consumes the block_q8_1_mmq operand above unchanged (same arithmetic, same rounding
         // sequence as MMQ, bit for bit)
+        // a fused residual ADD (the dispatcher's {MUL_MAT, ADD} case): the INT8-MMA kernels write the ADD's output with its other
+        // operand added in the epilogue; no other path here can take it, so reaching one with it set is a dispatcher bug
+        float *       mma_dst = dst_d;
+        const float * mma_res = nullptr;
+        int64_t       mma_s1  = s1, mma_sres = 0;
+        if (fused_add) {
+            const ggml_tensor * other = fused_add->src[0] == dst ? fused_add->src[1] : fused_add->src[0];
+            mma_dst  = (float *) fused_add->data;
+            mma_res  = (const float *) other->data;
+            mma_s1   = fused_add->nb[1] / ts_dst;
+            mma_sres = other->nb[1] / ts_dst;
+        }
         if (src0->type == GGML_TYPE_Q4_0 && !use_native_fp4 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmq_q40_mma_supported(cc, smpbo, ne00, ne01, ne11)) {
-            ggml_cuda_mmq_q40_mma(src0_d, src1_q8_1_ptr, dst_d, ne00, ne01, ne11, s1, nb01, stream);
+            ggml_cuda_mmq_q40_mma(src0_d, src1_q8_1_ptr, mma_dst, ne00, ne01, ne11, mma_s1, nb01, mma_res, mma_sres, stream);
             return;
         }
         // Q8_0 with a batch of tokens on Blackwell (Qwen3.5's ssm_out and attn_output projections): the exact INT8-MMA kernel of
@@ -283,9 +297,10 @@ void ggml_cuda_mul_mat_q(
         // block_q8_1_mmq D4 operand above unchanged (same arithmetic, same rounding sequence as MMQ, bit for bit)
         if (src0->type == GGML_TYPE_Q8_0 && !use_native_fp4 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 &&
             ggml_cuda_mmq_q80_mma_supported(cc, smpbo, ne00, ne01, ne11)) {
-            ggml_cuda_mmq_q80_mma(src0_d, src1_q8_1_ptr, dst_d, ne00, ne01, ne11, s1, nb01, stream);
+            ggml_cuda_mmq_q80_mma(src0_d, src1_q8_1_ptr, mma_dst, ne00, ne01, ne11, mma_s1, nb01, mma_res, mma_sres, stream);
             return;
         }
+        GGML_ASSERT(!fused_add && "mmq: a fused residual add reached the plain path - the dispatcher's eligibility check disagrees with mmq.cu");
 
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1_ptr, nullptr, nullptr, dst_d,
