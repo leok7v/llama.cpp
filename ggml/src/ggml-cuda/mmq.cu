@@ -3,6 +3,7 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <algorithm>
 #include <cstdint>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream, const ggml_prec prec_src1) {
@@ -198,6 +199,17 @@ void ggml_cuda_mul_mat_q(
             // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
             if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+            }
+            // On a 20-SM sm_121 part the batch-wide tile is not the optimum either, and the per-expert average is far
+            // worse. Measured on Qwen3.6-35B-A3B (256 experts, 8 used: 16 tokens an expert at 512) and gemma-4-26B-A4B
+            // (128/8: 32 an expert), pp512 relative to J=128: J=16 0.59x, 32 0.87x, 48 1.01x, 64 1.09x/1.08x,
+            // 80 1.10x/1.09x, 96 1.07x/1.07x, 112 1.03x; greedy output byte-identical across J (the tile changes the
+            // schedule, not the per-element accumulation order). The stream-k grid walks every expert's ceil(ne12/J)
+            // column tiles, nearly all of them empty for a 16-token expert, so a small tile costs more in skipped tiles
+            // and split k-ranges than it saves in MMA work; 80 is the measured optimum (2026-10-19). The grouped schedule over the non-empty
+            // (expert, tile) pairs is the next step; this is the dispatcher-side part of it.
+            if (blackwell_mma_available(cc)) {
+                ncols_opt = std::min<int64_t>(ncols_opt, 80);
             }
         }
 
