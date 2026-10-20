@@ -202,16 +202,18 @@ void ggml_cuda_mul_mat_q(
             if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
             }
-            // On a 20-SM sm_121 part the batch-wide tile is not the optimum either, and the per-expert average is far
-            // worse. Measured on Qwen3.6-35B-A3B (256 experts, 8 used: 16 tokens an expert at 512) and gemma-4-26B-A4B
-            // (128/8: 32 an expert), pp512 relative to J=128: J=16 0.59x, 32 0.87x, 48 1.01x, 64 1.09x/1.08x,
-            // 80 1.10x/1.09x, 96 1.07x/1.07x, 112 1.03x; greedy output byte-identical across J (the tile changes the
-            // schedule, not the per-element accumulation order). The stream-k grid walks every expert's ceil(ne12/J)
-            // column tiles, nearly all of them empty for a 16-token expert, so a small tile costs more in skipped tiles
-            // and split k-ranges than it saves in MMA work; 80 is the measured optimum (2026-10-19). The grouped schedule over the non-empty
-            // (expert, tile) pairs is the next step; this is the dispatcher-side part of it.
+            // On a 20-SM sm_121 part the batch-wide tile is not the optimum either. The grouped schedule below walks only
+            // the (expert, column tile) pairs that hold data, so a small tile no longer pays for empty tiles and split
+            // k-ranges, and the token tile can follow the expert's share of the batch. Measured pp512 with the grouped
+            // schedule on Qwen3.6-35B-A3B (256 experts, 8 used: 16 tokens an expert at 512) and gemma-4-26B-A4B (128/8:
+            // 32 an expert), against the previous schedule at its own optimum J=80 (1,160 and 1,380 t/s): J=80 1,395 /
+            // 1,367, 64 1,396 / 1,392, 48 1,497 / -, 32 1,542 / 1,468, 24 1,506 / -, 16 1,464 / 1,346. Without the
+            // grouped schedule J=16 had been 0.59x and 80 the optimum (2026-10-19); with it 32 is the optimum on both
+            // (2026-10-20). test-backend-ops MUL_MAT_ID 931/931
+            // either way; the per-tile arithmetic is unchanged and stream-k's partial sums meet at different split
+            // points, so results agree to float rounding.
             if (blackwell_mma_available(cc)) {
-                ncols_opt = std::min<int64_t>(ncols_opt, 80);
+                ncols_opt = std::min<int64_t>(ncols_opt, 32);
             }
         }
 
@@ -299,7 +301,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, J_best};
+            ne1, J_best, nullptr};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
@@ -329,6 +331,12 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
+
+    // The grouped schedule: the J-wide column tiles that hold data, counted per expert (mmid.cu), so the stream-k partition
+    // in mmq.cuh spans only those and no block walks an empty tile. The tiled (non-stream-k) launch ignores it.
+    ggml_cuda_pool_alloc<int32_t> tile_bounds(ctx.pool(), ne02 + 1);
+    ggml_cuda_launch_mm_tile_bounds(expert_bounds.get(), tile_bounds.get(), ne02, J_best, stream);
+    CUDA_CHECK(cudaGetLastError());
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
@@ -378,7 +386,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, J_best};
+        ne12, J_best, tile_bounds.get()};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
