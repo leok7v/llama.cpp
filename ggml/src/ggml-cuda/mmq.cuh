@@ -948,13 +948,62 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 }
 
 
+// The tile space of the stream-k partition. Dense, and MoE without a grouped schedule: (row tile, sample, channel,
+// column tile) over every channel's ceil(ncols/J) column tiles, so an expert with 16 tokens still owns ceil(512/J) tiles of
+// which one holds data. With a grouped schedule (tile_bounds != nullptr, MoE only): (row tile, non-empty column tile) where
+// T = tile_bounds[nexperts] counts the J-wide tiles over all experts and a linear tile index finds its expert by a binary
+// search over tile_bounds; no block ever walks an empty tile, so a small J costs what it computes and nothing more.
+struct mmq_tile {
+    int it, jt, zt, wt;
+};
+
+static __device__ __forceinline__ int64_t mmq_tiles_total(
+        const int32_t * __restrict__ tile_bounds, const uint3 nsamples_y, const uint3 nchannels_y, const uint3 ntx, const int nty) {
+    return tile_bounds ? (int64_t) tile_bounds[nchannels_y.z] * nty : (int64_t) nsamples_y.z * nchannels_y.z * ntx.z * nty;
+}
+
+static __device__ __forceinline__ mmq_tile mmq_tile_at(
+        int tmp, const int32_t * __restrict__ tile_bounds, const uint3 nsamples_y, const uint3 nchannels_y, const uint3 ntx) {
+    mmq_tile t;
+    if (tile_bounds) {
+        const int T   = tile_bounds[nchannels_y.z];
+        const int lin = tmp % T;
+        t.it = tmp / T;
+        t.wt = 0;
+        int lo = 0;
+        int hi = nchannels_y.z;                     // the largest e with tile_bounds[e] <= lin; ties go to the largest e,
+        while (hi - lo > 1) {                       // which skips an empty expert whose bound equals the next one's
+            const int mid = (lo + hi) / 2;
+            if (tile_bounds[mid] <= lin) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        t.zt = lo;
+        t.jt = lin - tile_bounds[lo];
+    } else {
+        uint2 tmp2 = fast_div_modulo(tmp, ntx);
+        t.jt = tmp2.y;
+        tmp  = tmp2.x;
+        tmp2 = fast_div_modulo(tmp, nchannels_y);
+        t.zt = tmp2.y;
+        tmp  = tmp2.x;
+        tmp2 = fast_div_modulo(tmp, nsamples_y);
+        t.wt = tmp2.y;
+        t.it = tmp2.x;
+    }
+    return t;
+}
+
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1), ggml_cuda_mmq_get_occupancy(type, J, fallback, prec_src1))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
-        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_bounds,
+        float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
@@ -1064,8 +1113,9 @@ static __global__ void mul_mat_q(
     constexpr int blocks_per_iter = ITER_K / qk;
 
     // kbc == k block continuous, current index in continuous ijk space.
-    int kbc      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
-    int kbc_stop = int64_t(blockIdx.x + 1)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+    const int64_t kbc_total = mmq_tiles_total(tile_bounds, nsamples_y, nchannels_y, ntx, nty) * blocks_per_ne00.z;
+    int kbc      = int64_t(blockIdx.x)    *kbc_total / gridDim.x;
+    int kbc_stop = int64_t(blockIdx.x + 1)*kbc_total / gridDim.x;
 
     kbc      -= fastmodulo(kbc,      blocks_per_ne00) % blocks_per_iter;
     kbc_stop -= fastmodulo(kbc_stop, blocks_per_ne00) % blocks_per_iter;
@@ -1074,16 +1124,11 @@ static __global__ void mul_mat_q(
     int kb0_start = fastmodulo(kbc, blocks_per_ne00);
     int kb0_stop  = min(blocks_per_ne00.z, uint32_t(kb0_start + kbc_stop - kbc));
     while (kbc < kbc_stop && kb0_stop == int(blocks_per_ne00.z)) {
-        int tmp = fastdiv(kbc, blocks_per_ne00);
-        uint2 tmp2 = fast_div_modulo(tmp, ntx);
-        const int jt = tmp2.y;
-        tmp = tmp2.x;
-        tmp2 = fast_div_modulo(tmp, nchannels_y);
-        const int zt = tmp2.y;
-        tmp = tmp2.x;
-        tmp2 = fast_div_modulo(tmp, nsamples_y);
-        const int wt = tmp2.y;
-        const int it = tmp2.x;
+        const mmq_tile tl = mmq_tile_at(fastdiv(kbc, blocks_per_ne00), tile_bounds, nsamples_y, nchannels_y, ntx);
+        const int jt = tl.jt;
+        const int zt = tl.zt;
+        const int wt = tl.wt;
+        const int it = tl.it;
 
         // Defaults for regular matrix multiplication:
         int col_low    = 0;
@@ -1163,16 +1208,11 @@ static __global__ void mul_mat_q(
         return;
     }
 
-    int tmp = fastdiv(kbc, blocks_per_ne00);
-    uint2 tmp2 = fast_div_modulo(tmp, ntx);
-    const int jt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nchannels_y);
-    const int zt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nsamples_y);
-    const int wt = tmp2.y;
-    const int it = tmp2.x;
+    const mmq_tile tl = mmq_tile_at(fastdiv(kbc, blocks_per_ne00), tile_bounds, nsamples_y, nchannels_y, ntx);
+    const int jt = tl.jt;
+    const int zt = tl.zt;
+    const int wt = tl.wt;
+    const int it = tl.it;
 
     // Defaults for regular matrix multiplication:
     int col_low    = 0;
@@ -1240,7 +1280,8 @@ static __global__ void mul_mat_q(
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
-        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
+        const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ tile_bounds,
+        float * __restrict__ dst,
         float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
         const int stride_sample_dst, const uint3 ntx) {
@@ -1259,8 +1300,9 @@ static __global__ void mul_mat_q_stream_k_fixup(
     const int bidx0 = blockIdx.x;
 
     // kbc == k block continuous, current index in continuous ijk space.
-    int kbc0      = int64_t(blockIdx.x)    *(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
-    int kbc0_stop = int64_t(blockIdx.x + 1)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+    const int64_t kbc_total = mmq_tiles_total(tile_bounds, nsamples_y, nchannels_y, ntx, nty) * blocks_per_ne00.z;
+    int kbc0      = int64_t(blockIdx.x)    *kbc_total / gridDim.x;
+    int kbc0_stop = int64_t(blockIdx.x + 1)*kbc_total / gridDim.x;
 
     kbc0      -= fastmodulo(kbc0,      blocks_per_ne00) % blocks_per_iter;
     kbc0_stop -= fastmodulo(kbc0_stop, blocks_per_ne00) % blocks_per_iter;
@@ -1279,7 +1321,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     int bidx = bidx0 - 1;
     int kbc_stop = kbc0;
     while(true) {
-        int kbc = int64_t(bidx)*(nsamples_y.z*nchannels_y.z*ntx.z*nty*blocks_per_ne00.z) / gridDim.x;
+        int kbc = int64_t(bidx)*kbc_total / gridDim.x;
         kbc -= fastmodulo(kbc, blocks_per_ne00) % blocks_per_iter;
 
         if (kbc == kbc_stop) { // Did not have any data.
@@ -1310,16 +1352,11 @@ static __global__ void mul_mat_q_stream_k_fixup(
         return;
     }
 
-    int tmp = fastdiv(kbc0, blocks_per_ne00);
-    uint2 tmp2 = fast_div_modulo(tmp, ntx);
-    const int jt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nchannels_y);
-    const int zt = tmp2.y;
-    tmp = tmp2.x;
-    tmp2 = fast_div_modulo(tmp, nsamples_y);
-    const int wt = tmp2.y;
-    const int it = tmp2.x;
+    const mmq_tile tl = mmq_tile_at(fastdiv(kbc0, blocks_per_ne00), tile_bounds, nsamples_y, nchannels_y, ntx);
+    const int jt = tl.jt;
+    const int zt = tl.zt;
+    const int wt = tl.wt;
+    const int it = tl.it;
 
     if (!ids_dst) {
         const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*J*stride_col_dst + it*I;
@@ -1383,6 +1420,7 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
     int J_best; // Tile width in ne11(dense)/ne12(MoE) direction to use for optimal performance.
+    const int32_t * tile_bounds; // MoE: the grouped schedule over the non-empty (expert, column tile) pairs; nullptr = none
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1427,8 +1465,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
     if (!config.stream_k) {
+        // the tiled launch indexes tiles by blockIdx and knows nothing of the grouped schedule
         mul_mat_q<type, J, fallback, prec_src1><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
+            (args.x, args.y, args.ids_dst, args.expert_bounds, nullptr, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1438,6 +1477,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
+    // A grouped schedule's tile count lives on the device (tile_bounds[nexperts]); the host's ntiles_dst is its upper bound,
+    // so the grid never takes the tiled form and the fixup pass always runs - the kernel reads the real total itself.
+    const bool grouped = args.tile_bounds != nullptr;
     const int ntiles_dst = ntx * nty * ntzw;
     const int tiles_nwaves = (ntiles_dst + nsm - 1) / nsm;
     const int tiles_efficiency_percent = 100 * ntiles_dst / (nsm*tiles_nwaves);
@@ -1445,9 +1487,9 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
     const int nwork = ntiles_dst * ((args.ncols_x + config.K_vram - 1) / config.K_vram); // Maximum number of CUDA blocks that can do useful work.
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : std::min(nsm, nwork), 1, 1);
+    const dim3 block_nums_stream_k(!grouped && GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : std::min(nsm, nwork), 1, 1);
 
-    const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+    const bool fixup_needed = grouped || ntiles_dst % block_nums_stream_k.x != 0;
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
@@ -1459,7 +1501,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
     mul_mat_q<type, J, fallback, prec_src1><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
-        (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
+        (args.x, args.y, args.ids_dst, args.expert_bounds, args.tile_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1471,7 +1513,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     CUDA_CHECK(cudaGetLastError());
     mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
-        (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+        (args.ids_dst, args.expert_bounds, args.tile_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
          ntx_fd);
 }
