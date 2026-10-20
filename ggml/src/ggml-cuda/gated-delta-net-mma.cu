@@ -51,7 +51,7 @@ template <int C, int V> struct alignas(128) shared {
         matrix<C, V> solved;
     } scratch;
 
-    float lower[C * C], prefix[C], beta[C];
+    float lower[C * C], prefix[C], beta[C], decay[C];
 
     static __device__ __forceinline__ int lower_index(int r, int c) { return r * C + c; }
 };
@@ -171,11 +171,17 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             }
         }
     };
-    // Carry the first eight input rows across chunks to hide global-load latency.
-    constexpr bool PREFETCH = C == 16 && V == 32;
+    // Carry the first eight input rows and the next chunk's gates across chunks to hide global-load latency: every
+    // operand a chunk needs is requested one chunk ahead, so the serial chain never waits on a fresh global load.
+    constexpr bool PREFETCH = C == 16;
     float4         next_q, next_k;
+    float          next_g = 0.f, next_beta = 0.f;
     if constexpr (PREFETCH) {
         read_qk(0, next_q, next_k);
+        if (warp == 0 && lane < a.n_tokens) {
+            next_g    = a.g[goff + lane * a.sb2];
+            next_beta = a.beta[goff + lane * a.sb2];
+        }
     }
     for (int64_t t0 = 0; t0 < a.n_tokens; t0 += C) {
         const int valid = min((int64_t) C, a.n_tokens - t0);
@@ -194,13 +200,22 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             s.k.store2(t, d, make_float2(k.x, k.y));
             s.k.store2(t, d + 2, make_float2(k.z, k.w));
         }
-        // Load gates in parallel before the FP32 prefix scan.
+        // The FP32 prefix scan of the gates, and the per-token decay the projections read from a table.
         if (warp == 0) {
             float carry = 0.f;
             for (int base = 0; base < C; base += 32) {
                 const int   t    = base + lane;
-                float       g    = t < valid ? a.g[goff + (t0 + t) * a.sb2] : 0.f;
-                const float beta = t < valid ? a.beta[goff + (t0 + t) * a.sb2] : 0.f;
+                float       g, beta;
+                if constexpr (PREFETCH) {
+                    g    = next_g;
+                    beta = next_beta;
+                    const int tn = t0 + C + t;
+                    next_g    = tn < a.n_tokens ? a.g[goff + tn * a.sb2]    : 0.f;
+                    next_beta = tn < a.n_tokens ? a.beta[goff + tn * a.sb2] : 0.f;
+                } else {
+                    g    = t < valid ? a.g[goff + (t0 + t) * a.sb2] : 0.f;
+                    beta = t < valid ? a.beta[goff + (t0 + t) * a.sb2] : 0.f;
+                }
 #pragma unroll
                 for (int offset = 1; offset < 32; offset *= 2) {
                     const float previous = __shfl_up_sync(0xffffffff, g, offset, 32);
@@ -212,6 +227,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 if (t < C) {
                     s.prefix[t] = g;
                     s.beta[t]   = beta;
+                    s.decay[t]  = expf(g);
                 }
                 carry = __shfl_sync(0xffffffff, g, 31, 32);
             }
@@ -231,24 +247,77 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         constexpr bool SPLIT_PROJECTION = C == 16 && V == 32;
         acc            base_output[((C / 16) * (V / N) + WARPS - 1) / WARPS];
         // delta = beta * (v - decay * K S), base output = decay * Q S
+        // the shared A-tile form needs the projection tiles to divide across the warps; the RDNA3 V=64 form has 4 tiles for 8 warps
+        constexpr bool SHARED_A = (C / 16) * (V / N) % WARPS == 0 && (C / 16) * (V / N) >= WARPS;
         auto           project = [&]() {
-            if constexpr (V == 32) {
-                if (warp < 4) {
-                    return;
+            if constexpr (V == 32 || !SHARED_A) {
+                if constexpr (V == 32) {
+                    if (warp < 4) {
+                        return;
+                    }
                 }
-            }
-            for (int ti = (V == 32 ? warp - 4 : warp); ti < (C / 16) * (V / N); ti += (V == 32 ? 4 : WARPS)) {
-                const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
-                acc       qs, ks;
-                product<D, false, true>(qs, s.q, s.scratch.state, r, c);
-                product<D, false, true>(ks, s.k, s.scratch.state, r, c);
+                for (int ti = (V == 32 ? warp - 4 : warp); ti < (C / 16) * (V / N); ti += (V == 32 ? 4 : WARPS)) {
+                    const int r = (ti / (V / N)) * 16, c = (ti % (V / N)) * N;
+                    acc       qs, ks;
+                    product<D, false, true>(qs, s.q, s.scratch.state, r, c);
+                    product<D, false, true>(ks, s.k, s.scratch.state, r, c);
 #pragma unroll
-                for (int i = 0; i < acc::ne; ++i) {
-                    const int   t = r + acc::get_i(i), v = c + acc::get_j(i);
-                    const float decay = expf(s.prefix[t]);
-                    const float vv    = t < valid ? a.v[voff + (t0 + t) * a.sv2 + v] : 0.f;
-                    s.delta.store(t, v, s.beta[t] * (vv - decay * ks.x[i]));
-                    base_output[ti / WARPS].x[i] = decay * qs.x[i];
+                    for (int i = 0; i < acc::ne; ++i) {
+                        const int   t = r + acc::get_i(i), v = c + acc::get_j(i);
+                        const float decay = s.decay[t];
+                        const float vv    = t < valid ? a.v[voff + (t0 + t) * a.sv2 + v] : 0.f;
+                        s.delta.store(t, v, s.beta[t] * (vv - decay * ks.x[i]));
+                        base_output[ti / WARPS].x[i] = decay * qs.x[i];
+                    }
+                }
+            } else {
+                // The warp's tiles share the one 16-row group (C = 16), so each k-step loads the Q and K A-tiles once for
+                // all of them and the tiles' MMA chains advance together; the chunk's v values are requested BEFORE the
+                // products so their global latency hides behind the MMA work instead of following it in the epilogue.
+                // Per tile the accumulation order is the one above, so the result is unchanged.
+                static_assert(C == 16, "the shared A-tile assumes one 16-row group per chunk");
+                constexpr int T = (C / 16) * (V / N) / WARPS;
+                static_assert(T >= 1 && (C / 16) * (V / N) % WARPS == 0, "projection tiles divide across the warps");
+                acc   qs[T], ks[T];
+                float vpre[T][acc::ne];
+#pragma unroll
+                for (int j = 0; j < T; ++j) {
+                    const int c = ((warp + j * WARPS) % (V / N)) * N;
+#pragma unroll
+                    for (int i = 0; i < acc::ne; ++i) {
+                        const int t = acc::get_i(i), v = c + acc::get_j(i);
+                        vpre[j][i] = t < valid ? a.v[voff + (t0 + t) * a.sv2 + v] : 0.f;
+                    }
+                }
+#pragma unroll
+                for (int k = 0; k < D; k += 16) {
+                    const auto qh = load<a_tile, false>(s.q, 0, k, false);
+                    const auto ql = load<a_tile, false>(s.q, 0, k, true);
+                    const auto kh = load<a_tile, false>(s.k, 0, k, false);
+                    const auto kl = load<a_tile, false>(s.k, 0, k, true);
+#pragma unroll
+                    for (int j = 0; j < T; ++j) {
+                        const int  c  = ((warp + j * WARPS) % (V / N)) * N;
+                        const auto bh = load<b_tile, true>(s.scratch.state, c, k, false);
+                        const auto bl = load<b_tile, true>(s.scratch.state, c, k, true);
+                        mma(qs[j], ql, bh);
+                        mma(qs[j], qh, bl);
+                        mma(qs[j], qh, bh);
+                        mma(ks[j], kl, bh);
+                        mma(ks[j], kh, bl);
+                        mma(ks[j], kh, bh);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < T; ++j) {
+                    const int c = ((warp + j * WARPS) % (V / N)) * N;
+#pragma unroll
+                    for (int i = 0; i < acc::ne; ++i) {
+                        const int   t = acc::get_i(i), v = c + acc::get_j(i);
+                        const float decay = s.decay[t];
+                        s.delta.store(t, v, s.beta[t] * (vpre[j][i] - decay * ks[j].x[i]));
+                        base_output[j].x[i] = decay * qs[j].x[i];
+                    }
                 }
             }
         };
