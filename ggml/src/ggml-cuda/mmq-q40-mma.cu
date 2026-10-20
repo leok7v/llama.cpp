@@ -3,6 +3,7 @@
 
 #include <cuda.h>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 
@@ -335,6 +336,16 @@ namespace {
 constexpr int Q40MMA_BM = 128, Q40MMA_BN = 128, Q40MMA_WN = 64, Q40MMA_NSTAGE = 3, Q40MMA_NW = 8, Q40MMA_WM = 32;
 constexpr bool Q40MMA_PIPE = false, Q40MMA_SCL = true, Q40MMA_BPF = true, Q40MMA_RES = false;
 constexpr int Q40MMA_SMEM = Q40MMA_NSTAGE*(Q40MMA_BM*q4k::A_ROW + Q40MMA_BN*q4k::B_ROW) + Q40MMA_NW*2*(Q40MMA_WN + 2*Q40MMA_WM)*4 + Q40MMA_NSTAGE*12 + 64;
+// EXPERIMENT (branch GEMM-TILES, never shipped): a 128 x 64 tile - the same 8 warps as 32 x 32 - doubles the tile count, so a
+// 20-SM part fills its last wave better on the N=4096 projections (128 tiles = 6.4 waves -> 256 = 12.8). GGML_CUDA_Q40_TILE=64
+// selects it for every qualifying call; the arithmetic per output element is the same sequence (tile shape does not enter it).
+constexpr int Q40MMA_BN64 = 64, Q40MMA_WN64 = 32;
+constexpr int Q40MMA_SMEM64 = Q40MMA_NSTAGE*(Q40MMA_BM*q4k::A_ROW + Q40MMA_BN64*q4k::B_ROW) + Q40MMA_NW*2*(Q40MMA_WN64 + 2*Q40MMA_WM)*4 + Q40MMA_NSTAGE*12 + 64;
+static int q40mma_tile_knob() {
+    static int knob = -1;
+    if (knob < 0) { const char * e = getenv("GGML_CUDA_Q40_TILE"); knob = e ? atoi(e) : 0; }
+    return knob;
+}
 
 typedef CUresult (*encode_tiled_t)(CUtensorMap *, CUtensorMapDataType, cuuint32_t, void *, const cuuint64_t *, const cuuint64_t *,
                                    const cuuint32_t *, const cuuint32_t *, CUtensorMapInterleave, CUtensorMapSwizzle,
@@ -414,6 +425,17 @@ void ggml_cuda_mmq_q40_mma(const char * x, const char * y, float * dst,
     const bool okB = q40mma_map_2d(tmB, y, sizeof(block_q8_1_mmq), (uint64_t) (ne00/q4k::BK)*ne11, sizeof(block_q8_1_mmq), q4k::B_ROW, Q40MMA_BN);
     GGML_ASSERT(okB && "cuTensorMapEncodeTiled failed for the Q8_1 operand");
 
+    if (q40mma_tile_knob() == 64) {
+        CUtensorMap tmB64;
+        const bool okB64 = q40mma_map_2d(tmB64, y, sizeof(block_q8_1_mmq), (uint64_t) (ne00/q4k::BK)*ne11, sizeof(block_q8_1_mmq), q4k::B_ROW, Q40MMA_BN64);
+        GGML_ASSERT(okB64 && "cuTensorMapEncodeTiled failed for the Q8_1 operand (64-token box)");
+        CUDA_SET_SHARED_MEMORY_LIMIT((q4_0_q8_1_gemm_tma<Q40MMA_BM, Q40MMA_BN64, Q40MMA_WN64, Q40MMA_NSTAGE, Q40MMA_NW, Q40MMA_PIPE, Q40MMA_SCL, Q40MMA_BPF, Q40MMA_RES>), Q40MMA_SMEM64);
+        const int grid64 = (int) ((ne01/Q40MMA_BM) * ((ne11 + Q40MMA_BN64 - 1)/Q40MMA_BN64));
+        q4_0_q8_1_gemm_tma<Q40MMA_BM, Q40MMA_BN64, Q40MMA_WN64, Q40MMA_NSTAGE, Q40MMA_NW, Q40MMA_PIPE, Q40MMA_SCL, Q40MMA_BPF, Q40MMA_RES><<<grid64, 32*Q40MMA_NW, Q40MMA_SMEM64, stream>>>
+            (tmA, tmB64, dst, (int) ne01, (int) ne11, (int) ne00, stride_dst, res, stride_res);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     CUDA_SET_SHARED_MEMORY_LIMIT((q4_0_q8_1_gemm_tma<Q40MMA_BM, Q40MMA_BN, Q40MMA_WN, Q40MMA_NSTAGE, Q40MMA_NW, Q40MMA_PIPE, Q40MMA_SCL, Q40MMA_BPF, Q40MMA_RES>), Q40MMA_SMEM);
     const int grid = (int) ((ne01/Q40MMA_BM) * ((ne11 + Q40MMA_BN - 1)/Q40MMA_BN));
     q4_0_q8_1_gemm_tma<Q40MMA_BM, Q40MMA_BN, Q40MMA_WN, Q40MMA_NSTAGE, Q40MMA_NW, Q40MMA_PIPE, Q40MMA_SCL, Q40MMA_BPF, Q40MMA_RES><<<grid, 32*Q40MMA_NW, Q40MMA_SMEM, stream>>>
