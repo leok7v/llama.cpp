@@ -52,7 +52,7 @@ template <int C, int V> struct alignas(128) shared {
         matrix<C, V> solved;
     } scratch;
 
-    float lower[C * C], prefix[C], beta[C];
+    float lower[C * C], prefix[C], beta[C], decay[C];
 
     static __device__ __forceinline__ int lower_index(int r, int c) { return r * C + c; }
 };
@@ -173,10 +173,17 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
         }
     };
     // Carry the first eight input rows across chunks to hide global-load latency.
-    constexpr bool PREFETCH = C == 16 && V == 32;
+    constexpr bool PREFETCH = C == 16 && (V == 32 || IL >= 3);
     float4         next_q, next_k;
+    float          next_g = 0.f, next_beta = 0.f;
     if constexpr (PREFETCH) {
         read_qk(0, next_q, next_k);
+    }
+    if constexpr (IL >= 3 && C == 16) {
+        if (warp == 0 && lane < a.n_tokens) {
+            next_g    = a.g[goff + lane * a.sb2];
+            next_beta = a.beta[goff + lane * a.sb2];
+        }
     }
     for (int64_t t0 = 0; t0 < a.n_tokens; t0 += C) {
         const int valid = min((int64_t) C, a.n_tokens - t0);
@@ -200,8 +207,17 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
             float carry = 0.f;
             for (int base = 0; base < C; base += 32) {
                 const int   t    = base + lane;
-                float       g    = t < valid ? a.g[goff + (t0 + t) * a.sb2] : 0.f;
-                const float beta = t < valid ? a.beta[goff + (t0 + t) * a.sb2] : 0.f;
+                float       g, beta;
+                if constexpr (IL >= 3 && C == 16) {
+                    g    = next_g;
+                    beta = next_beta;
+                    const int tn = t0 + C + t;
+                    next_g    = tn < a.n_tokens ? a.g[goff + tn * a.sb2]    : 0.f;
+                    next_beta = tn < a.n_tokens ? a.beta[goff + tn * a.sb2] : 0.f;
+                } else {
+                    g    = t < valid ? a.g[goff + (t0 + t) * a.sb2] : 0.f;
+                    beta = t < valid ? a.beta[goff + (t0 + t) * a.sb2] : 0.f;
+                }
 #pragma unroll
                 for (int offset = 1; offset < 32; offset *= 2) {
                     const float previous = __shfl_up_sync(0xffffffff, g, offset, 32);
@@ -213,6 +229,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
                 if (t < C) {
                     s.prefix[t] = g;
                     s.beta[t]   = beta;
+                    if constexpr (IL >= 3) { s.decay[t] = expf(g); }
                 }
                 carry = __shfl_sync(0xffffffff, g, 31, 32);
             }
@@ -284,7 +301,7 @@ static __global__ __launch_bounds__(256, BLOCKS) void gdn_single(ggml_cuda_gdn_m
 #pragma unroll
                     for (int i = 0; i < acc::ne; ++i) {
                         const int   t = acc::get_i(i), v = c + acc::get_j(i);
-                        const float decay = expf(s.prefix[t]);
+                        const float decay = IL >= 3 ? s.decay[t] : expf(s.prefix[t]);
                         const float vv    = IL >= 2 ? vpre[j][i] : (t < valid ? a.v[voff + (t0 + t) * a.sv2 + v] : 0.f);
                         s.delta.store(t, v, s.beta[t] * (vv - decay * ks[j].x[i]));
                         base_output[j].x[i] = decay * qs[j].x[i];
@@ -440,7 +457,7 @@ template <int C, int V, int BLOCKS = 1, int IL = 0> bool init(int device) {
     return available[device];
 }
 
-enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head, chunk32, chunk64, chunk32_slice64, chunk32_slice32, whole_head_il, slice64_il, whole_head_il2 };
+enum class gdn_path { ar, slice32_one_block, slice32_two_blocks, slice64, whole_head, chunk32, chunk64, chunk32_slice64, chunk32_slice32, whole_head_il, slice64_il, whole_head_il2, whole_head_il3 };
 
 static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a) {
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
@@ -480,6 +497,7 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
             case 11: return init<16, 128, 1, true>(device) ? gdn_path::whole_head_il : gdn_path::ar;
             case 12: return init<16, 64, 1, true>(device)  ? gdn_path::slice64_il    : gdn_path::ar;
             case 13: return init<16, 128, 1, 2>(device)    ? gdn_path::whole_head_il2 : gdn_path::ar;
+            case 14: return init<16, 128, 1, 3>(device)    ? gdn_path::whole_head_il3 : gdn_path::ar;
             default: return gdn_path::ar;
         }
     }
@@ -517,6 +535,8 @@ bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cuda
         gdn_single<64, 128><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<64, 128>), stream>>>(a);
     } else if (path == gdn_path::whole_head_il) {
         gdn_single<16, 128, 1, true><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<16, 128>), stream>>>(a);
+    } else if (path == gdn_path::whole_head_il3) {
+        gdn_single<16, 128, 1, 3><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<16, 128>), stream>>>(a);
     } else if (path == gdn_path::whole_head_il2) {
         gdn_single<16, 128, 1, 2><<<a.H * a.n_seqs, dim3(32, 8), sizeof(shared<16, 128>), stream>>>(a);
     } else if (path == gdn_path::slice64_il) {
