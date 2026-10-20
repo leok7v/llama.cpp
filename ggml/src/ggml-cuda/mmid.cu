@@ -177,3 +177,36 @@ void ggml_cuda_launch_mm_ids_helper(
             break;
     }
 }
+
+// One block of the next power of two above n_experts threads: each thread takes one expert's tile count, a Hillis-Steele
+// scan in shared memory gives the exclusive prefix sums. Microseconds beside the GEMM it schedules.
+static __global__ void mm_tile_bounds(
+        const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ tile_bounds, const int n_experts, const int J) {
+    __shared__ int32_t s[1024];
+    const int e = threadIdx.x;
+    const int32_t v = e < n_experts ? (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J : 0;
+    s[e] = v;
+    __syncthreads();
+    for (int off = 1; off < (int) blockDim.x; off *= 2) {
+        const int32_t t = e >= off ? s[e - off] : 0;
+        __syncthreads();
+        s[e] += t;
+        __syncthreads();
+    }
+    if (e < n_experts) {
+        tile_bounds[e] = s[e] - v;
+    }
+    if (e == n_experts - 1) {
+        tile_bounds[n_experts] = s[e];
+    }
+}
+
+void ggml_cuda_launch_mm_tile_bounds(
+        const int32_t * __restrict__ expert_bounds, int32_t * __restrict__ tile_bounds, const int n_experts, const int J, cudaStream_t stream) {
+    GGML_ASSERT(n_experts >= 1 && n_experts <= 1024);
+    int nt = 32;
+    while (nt < n_experts) {
+        nt *= 2;
+    }
+    mm_tile_bounds<<<1, nt, 0, stream>>>(expert_bounds, tile_bounds, n_experts, J);
+}
