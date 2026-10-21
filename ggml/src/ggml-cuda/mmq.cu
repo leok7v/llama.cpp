@@ -4,6 +4,7 @@
 #include "mmid.cuh"
 #include "mmq-q40-mma.cuh"
 #include "mmq-q80-mma.cuh"
+#include "mmq-q40-mma-id.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -378,6 +379,16 @@ void ggml_cuda_mul_mat_q(
     const int64_t s12 = use_native_fp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_FP4_MMQ * sizeof(int)) :
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
+
+    // Q4_0 experts on Blackwell: the exact INT8-MMA TMA kernel of mmq-q40-mma-id.cu takes the routed GEMM in MMQ's place when the
+    // shape qualifies (K % 256, 16-byte pitches); it consumes the compact operand above unchanged (the dense kernel's arithmetic,
+    // MMQ's single-pass rounding sequence, bit for bit) and writes through ids_dst
+    if (src0->type == GGML_TYPE_Q4_0 && !use_native_fp4 && ne03 == 1 && ne13 == 1 &&
+        ggml_cuda_mmq_q40_mma_id_supported(cc, smpbo, ne00, ne01, ne02, nb01, nb02)) {
+        ggml_cuda_mmq_q40_mma_id(ctx, src0_d, src1_q8_1.get(), dst_d, ids_dst.get(), expert_bounds.get(),
+                                 ne00, ne01, ne02, ne_get_rows, s1, nb01, nb02, stream);
+        return;
+    }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {

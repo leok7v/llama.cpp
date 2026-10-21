@@ -11388,6 +11388,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
+    // routed Q4_0 experts with a batch of tokens on the shapes the INT8 tensor-core TMA GEMM for mul_mat_id takes (K % 256,
+    // 16-byte pitches): Qwen3.6-35B-A3B's gate/up (broadcast operand) and down, gemma-4-26B-A4B's fused gate/up (M 1408) and
+    // its down (K 704, a 396-byte pitch the TMA path refuses: MMQ), and an M that is not a multiple of the 128-row tile
+    for (int64_t n : {64, 200, 512}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 256, 8, false,  512, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 256, 8, true,   512, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 256, 8, false, 2048, n,  512));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, true,  1408, n, 2816));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 128, 8, false, 2816, n,  704));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32,  64, 8, false,  704, n, 2048));
+    }
+
     // multiple blocks per row: exercises the block-stride loop and the
     // per-expert base offset, which k == 256 alone leaves untested
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
