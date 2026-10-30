@@ -4625,6 +4625,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (n_extra_lt > 0) {
             return n_extra_lt;
         }
+        const int n_extra_g = ggml_cuda_gated_norm_nvfp4_lt_arm(*cuda_ctx, cgraph, i);
+        if (n_extra_g > 0) {
+            return n_extra_g;
+        }
+    }
+    if (node->op == GGML_OP_UNARY) {
+        const int n_extra_g = ggml_cuda_gated_norm_nvfp4_lt_fire(*cuda_ctx, cgraph, i);
+        if (n_extra_g > 0) {
+            return n_extra_g;
+        }
     }
     ggml_cuda_mmq_fuse_note_node(cgraph, i);
     if (node->op == GGML_OP_GLU) {
