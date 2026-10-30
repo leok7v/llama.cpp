@@ -316,11 +316,21 @@ struct lt_scratch {
 
 // the candidate chosen per shape is remembered across processes in a small text file: the candidates differ in their fp32
 // summation order, so a choice that depends on a timing race made greedy decoding differ between runs.
+// The file lives under HOME when HOME takes an append and under /tmp otherwise: a read-only HOME (root's on one test system) kept
+// every process on its own timing race.
 static const char * lt_tune_path() {
     static std::string p;
     if (p.empty()) {
         const char * home = getenv("HOME");
-        p = std::string(home && *home ? home : "/tmp") + "/.ggml-cuda-nvfp4-lt.tune";
+        std::string chosen = std::string(home && *home ? home : "/tmp") + "/.ggml-cuda-nvfp4-lt.tune";
+        FILE * probe = fopen(chosen.c_str(), "a");
+        if (probe) {
+            fclose(probe);
+        } else {
+            chosen = "/tmp/.ggml-cuda-nvfp4-lt.tune";
+        }
+        p = chosen;
+        GGML_LOG_INFO("%s: the per-shape algorithm choices persist in %s\n", __func__, p.c_str());
     }
     return p.c_str();
 }
