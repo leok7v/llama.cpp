@@ -16,6 +16,13 @@ bool ggml_cuda_mul_mat_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_tens
 // the pattern or the shape does not qualify (nothing launched).
 int ggml_cuda_mul_mat_nvfp4_lt_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
 
+// A gated per-head output norm: RMS_NORM over hd-wide heads at cgraph->nodes[node_idx], its weight MUL, later SILU(z) and the MUL
+// that joins them [and a RESHAPE], feeding one NVFP4 matmul. _arm at the norm computes the per-head row scales and returns 1 (the
+// weight MUL consumed); _fire at the SILU quantizes silu(z) * normed straight to FP4, parks it for the matmul, and returns the nodes
+// consumed (the MUL, and the reshape). Both return 0 when the pattern does not qualify (nothing launched).
+int ggml_cuda_gated_norm_nvfp4_lt_arm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+int ggml_cuda_gated_norm_nvfp4_lt_fire(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+
 // The dispatcher calls this before computing cgraph->nodes[node_idx]; it lets consecutive matmuls of one evaluation that read
 // the same src1 tensor share one FP4 quantization of it.
 void ggml_cuda_nvfp4_lt_note_node(const ggml_cgraph * cgraph, int node_idx);
