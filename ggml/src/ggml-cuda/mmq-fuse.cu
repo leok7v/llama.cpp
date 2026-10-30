@@ -240,6 +240,7 @@ struct fuse_state {
     float * rowscale_g = nullptr; size_t rowscale_g_cap = 0;         // the gated norm's, alive from arm to fire
     const ggml_cgraph * cur_graph = nullptr; int cur_node = -1;
     bool announced = false;
+    bool gated_announced = false;
 };
 static fuse_state & fuse_state_for(int device) {
     static fuse_state s[GGML_CUDA_MAX_DEVICES];
@@ -661,6 +662,11 @@ int ggml_cuda_mmq_fuse_norm_gated_arm(ggml_backend_cuda_context & ctx, const ggm
         return 0;
     }
     announce(st, cc);
+    if (!st.gated_announced) {
+        GGML_LOG_INFO("mmq-fuse: gated per-head norms quantize straight into the Q8_1 operand (first at hd=%lld H=%lld T=%lld)\n",
+                      (long long) hd, (long long) H, (long long) T);
+        st.gated_announced = true;
+    }
     cudaStream_t stream = ctx.stream();
     const int64_t N = H * T;
     if (st.rowscale_g_cap < (size_t) N) {
@@ -709,4 +715,3 @@ int ggml_cuda_mmq_fuse_norm_gated_fire(ggml_backend_cuda_context & ctx, const gg
     g.armed = false;
     return n_extra;
 }
-
