@@ -5088,16 +5088,17 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    const float   g_min; // the gate's lower bound: -20 leaves no state across a 16-token chunk, -0.5 carries it
 
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, g_min);
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, float g_min = -20.0f)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), g_min(g_min) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -5134,7 +5135,7 @@ struct test_gated_delta_net : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -20.0f, -1e-4f);
+                init_tensor_uniform(t, g_min, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.0f, 1.0f);
             } else if (strcmp(t->name, "v") == 0) {
@@ -12384,6 +12385,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // the prefill shapes of the Qwen3.5 family at one 512-token ubatch: 16 key heads, head size 128, 16 or 32 value heads
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 2));
+    // 48 value heads (Qwen3.8-27B), a partial last chunk, and gates in the model's range so the state carries across chunks
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3, false, false, 1, -0.5f));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 519, 1, 2, false, false, 1, -0.5f));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
