@@ -4574,15 +4574,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // a matmul whose one-element MUL (the weight's global scale) folds into alpha, a GEGLU/SWIGLU quantized straight to FP4, and a
     // pre-norm whose every consumer is such a matmul. Each hook launches nothing and returns 0 when its pattern does not qualify.
     ggml_cuda_nvfp4_lt_note_node(cgraph, i);
-    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_NVFP4 && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
-        ggml_tensor *       mul = cgraph->nodes[i + 1];
-        const ggml_tensor * sc  = mul->src[0] == node ? mul->src[1] : (mul->src[1] == node ? mul->src[0] : nullptr);
-        if (sc && sc->type == GGML_TYPE_F32 && ggml_nelements(sc) == 1 && mul->type == GGML_TYPE_F32 && ggml_are_same_shape(mul, node) &&
-            ggml_is_contiguous(mul) && ggml_node_get_use_count(cgraph, i) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
-            const int out_nodes[] = { i + 1 };
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1) &&
-                ggml_cuda_mul_mat_nvfp4_lt(*cuda_ctx, node->src[0], node->src[1], mul, sc)) {
-                return 1;
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_NVFP4 && i + 1 < cgraph->n_nodes) {
+        // the chain behind an NVFP4 matmul: [MUL by its one-element scale] [ADD of a same-shape residual]; the scale folds into
+        // alpha, the residual into beta * C, and the last node of the chain is the GEMM's output
+        ggml_tensor *       out = node;
+        const ggml_tensor * sc  = nullptr;
+        const ggml_tensor * res = nullptr;
+        int n_chain = 0;
+        ggml_tensor * nxt = cgraph->nodes[i + 1];
+        if (nxt->op == GGML_OP_MUL && nxt->type == GGML_TYPE_F32 && (nxt->src[0] == out || nxt->src[1] == out) && ggml_are_same_shape(nxt, out) &&
+            ggml_is_contiguous(nxt) && ggml_node_get_use_count(cgraph, i) == 1 && !(out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            const ggml_tensor * other = nxt->src[0] == out ? nxt->src[1] : nxt->src[0];
+            if (other->type == GGML_TYPE_F32 && ggml_nelements(other) == 1) {
+                sc = other; out = nxt; n_chain = 1;
+                nxt = i + 2 < cgraph->n_nodes ? cgraph->nodes[i + 2] : nullptr;
+            }
+        }
+        if (nxt && nxt->op == GGML_OP_ADD && nxt->type == GGML_TYPE_F32 && (nxt->src[0] == out || nxt->src[1] == out) && ggml_are_same_shape(nxt, out) &&
+            ggml_is_contiguous(nxt) && ggml_node_get_use_count(cgraph, i + n_chain) == 1 && !(out->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            const ggml_tensor * other = nxt->src[0] == out ? nxt->src[1] : nxt->src[0];
+            if (other != out && other->type == GGML_TYPE_F32 && ggml_is_contiguous(other) && ggml_are_same_shape(other, out)) {
+                res = other; out = nxt; n_chain += 1;
+            }
+        }
+        if (n_chain > 0) {
+            const int out_nodes[] = { i + n_chain };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_chain + 1, out_nodes, 1) &&
+                ggml_cuda_mul_mat_nvfp4_lt(*cuda_ctx, node->src[0], node->src[1], out, sc, res)) {
+                return n_chain;
             }
         }
     }

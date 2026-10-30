@@ -5,8 +5,10 @@
 // dst = src0 (NVFP4 weights) x src1 (F32 activations), optionally times the one-element F32 x_scale the graph fused in,
 // through cuBLASLt's block-scaled FP4 tensor-core GEMM. Returns false, having launched nothing, when the shape, the
 // device or the library cannot take it - the caller then continues on the MMQ path.
+// res (nullable): a same-shape F32 residual the dispatcher found as the ADD after the matmul (or after its scale MUL); folded in
+// as beta * C, and dst is then the ADD's output.
 bool ggml_cuda_mul_mat_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                                ggml_tensor * dst, const ggml_tensor * x_scale);
+                                ggml_tensor * dst, const ggml_tensor * x_scale, const ggml_tensor * res = nullptr);
 
 // GEGLU or SWIGLU node at cgraph->nodes[node_idx] whose only consumer is an NVFP4 matmul (optionally followed by the one-element
 // MUL of the weight's global scale): the gated gelu and the activation quantize run as one kernel, the GLU output is
