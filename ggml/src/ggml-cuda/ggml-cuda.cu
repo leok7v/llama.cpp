@@ -4749,8 +4749,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // (gelu(gate)*up quantized straight into its operand), gate/up/GEGLU/down as one fused GEMM + one matmul, and a
     // pre-norm whose every consumer is an MMQ matmul (normed straight into the operand, parked for them)
     // NVFP4 weights on cuBLASLt's block-scaled FP4 path (mmq-nvfp4-lt.cu): the node being computed (for the shared-operand reuse),
-    // a matmul whose one-element MUL (the weight's global scale) folds into alpha, a GEGLU/SWIGLU quantized straight to FP4, and a
-    // pre-norm whose every consumer is such a matmul. Each hook launches nothing and returns 0 when its pattern does not qualify.
+    // a matmul whose one-element MUL (the weight's global scale) folds into alpha, a GEGLU/SWIGLU quantized straight to FP4, a
+    // pre-norm whose every consumer is such a matmul, and a gated per-head norm whose five nodes lead to one. Each hook launches
+    // nothing and returns 0 when its pattern does not qualify.
     ggml_cuda_nvfp4_lt_note_node(cgraph, i);
     if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_NVFP4 && i + 1 < cgraph->n_nodes) {
         // the chain behind an NVFP4 matmul: [MUL by its one-element scale] [ADD of a same-shape residual]; the scale folds into
@@ -4793,6 +4794,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n_extra_lt = ggml_cuda_rms_norm_nvfp4_lt(*cuda_ctx, cgraph, i);
         if (n_extra_lt > 0) {
             return n_extra_lt;
+        }
+        const int n_extra_g = ggml_cuda_gated_norm_nvfp4_lt(*cuda_ctx, cgraph, i);
+        if (n_extra_g > 0) {
+            return n_extra_g;
         }
     }
     ggml_cuda_mmq_fuse_note_node(cgraph, i);
