@@ -24,3 +24,9 @@ void ggml_cuda_nvfp4_lt_note_node(const ggml_cgraph * cgraph, int node_idx);
 // the normed activation is written straight to FP4 and parked for those matmuls; the F32 tensor is never written. Returns 1
 // (the MUL consumed) or 0 (nothing launched).
 int ggml_cuda_rms_norm_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+
+// RMS_NORM over 128-wide heads at cgraph->nodes[node_idx], then its weight MUL, the gate's SILU, the MUL that joins them and an
+// optional RESHAPE, in consecutive nodes, read by one NVFP4 matmul this path takes: silu(z) * normed is written straight to FP4
+// at the norm and parked for the matmul. Returns the extra nodes consumed (3 or 4) or 0 (nothing launched); a refusal's reason
+// is logged once per distinct reason.
+int ggml_cuda_gated_norm_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);

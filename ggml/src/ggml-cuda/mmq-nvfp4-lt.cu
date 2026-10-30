@@ -24,7 +24,10 @@
 //     dispatcher notes the node being computed (ggml_cuda_nvfp4_lt_note_node) and a later node with the same src1 object
 //     reuses the FP4 operand in the scratch, recomputing only alpha for its own weight scale;
 //   - a pre-norm (RMS_NORM + weight MUL) whose every consumer is such a matmul is written straight to FP4 by one kernel
-//     (ggml_cuda_rms_norm_nvfp4_lt): the F32 normed activation never exists in memory either.
+//     (ggml_cuda_rms_norm_nvfp4_lt): the F32 normed activation never exists in memory either;
+//   - a gated per-head norm (RMS_NORM over 128-wide heads, MUL(w), SILU(z), MUL, [RESHAPE]) whose consumer is such a matmul,
+//     with the five nodes consecutive, is written straight to FP4 by one kernel at the norm (ggml_cuda_gated_norm_nvfp4_lt);
+//     the matcher is a pure function of the graph and names the first condition a graph fails.
 #include "mmq-nvfp4-lt.cuh"
 #include "unary.cuh"   // ggml_cuda_op_gelu_single: the same tanh gelu the GLU kernel applies
 
@@ -86,14 +89,27 @@ static __device__ __forceinline__ float round_to_ue4m3_mantissa(float d) {
     m = rintf(m * 16.0f) / 16.0f;            // 3 bits after the leading one
     return ldexpf(m, e);                     // m == 1.0 after a carry is still exact
 }
+// one lane's four values of silu(z) * rmsnorm(x) * w when the warp's 128 values are one head: the head's scale summed as
+// rms_norm_f32<32, 1, true> sums it (one float4 per lane, the warp butterfly), then scale * x * w, then silu(z) times that, so the
+// value quantized carries the three plain kernels' roundings
+static __device__ __forceinline__ float4 gated_norm_value(float4 v, float4 g, float4 w, float eps) {
+    float ss = 0.0f;
+    ss += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+    ss = warp_reduce_sum(ss);
+    const float sc = rsqrtf(ss / 128 + eps);
+    return make_float4(ggml_cuda_op_silu_single(g.x) * (sc * v.x * w.x), ggml_cuda_op_silu_single(g.y) * (sc * v.y * w.y),
+                       ggml_cuda_op_silu_single(g.z) * (sc * v.z * w.z), ggml_cuda_op_silu_single(g.w) * (sc * v.w * w.w));
+}
 // pass 1, a warp per 128 consecutive values of one row: lane l holds values 4l..4l+3 (one float4 per lane, 512 B per warp
 // load), a 16-value block is 4 lanes and its maximum a two-step shuffle; d0 = block max / 6 rounded to UE4M3's 3 mantissa bits
 // with an unbounded exponent (so the later division by a power-of-two tensor scale is exact); E2M1 values quantized against d0.
 // GEGLU: X is the gate and G the up projection, the value quantized is gelu(x) * g (ggml's tanh gelu, bit-identical to the GLU op).
 // K must be a multiple of 128 (every gemma width is); the caller checks.
-template <int GLU>   // 0: x; 1: gelu(x) * g (gemma's GEGLU); 2: silu(x) * g (Qwen's SWIGLU)
+// GLU 3, the gated per-head norm: the warp's 128 values are one head of X, G is the gate z, W the head-long norm weight.
+template <int GLU>   // 0: x; 1: gelu(x) * g (gemma's GEGLU); 2: silu(x) * g (Qwen's SWIGLU); 3: silu(g) * rmsnorm(x) * w
 static __global__ void k_quant_pass1(const float * __restrict__ X, const float * __restrict__ G, int N, int K, uint8_t * __restrict__ B,
-                                     float * __restrict__ d0s, float * __restrict__ bmax) {
+                                     float * __restrict__ d0s, float * __restrict__ bmax,
+                                     const float * __restrict__ W = nullptr, float eps = 0.0f) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int warps_per_block = blockDim.x >> 5;
     const int chunks_per_row = K / 128;
@@ -115,6 +131,8 @@ static __global__ void k_quant_pass1(const float * __restrict__ X, const float *
             v.y = ggml_cuda_op_silu_single(v.y) * g.y;
             v.z = ggml_cuda_op_silu_single(v.z) * g.z;
             v.w = ggml_cuda_op_silu_single(v.w) * g.w;
+        } else if constexpr (GLU == 3) {
+            v = gated_norm_value(v, reinterpret_cast<const float4 *>(G + off)[lane], reinterpret_cast<const float4 *>(W)[lane], eps);
         }
         float bam = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
         bam = fmaxf(bam, __shfl_xor_sync(0xffffffff, bam, 1));
@@ -364,6 +382,8 @@ struct lt_state {
     float *                                          scal = nullptr;   // [0] alpha, [1] beta = 0, [2] max block scale bits
     bool                                             announced = false;
     bool                                             warned    = false;
+    const char *                                     said[16]  = {};   // the gated norm's reasons logged so far, once each
+    int                                              n_said    = 0;
     // the graph node being computed (ggml_cuda_nvfp4_lt_note_node) and the operand the scratch currently holds: a later node of
     // the SAME graph evaluation whose src1 is the same tensor object reuses it (q, k, v read one normed input; gate and up another)
     const ggml_cgraph *                              cur_graph = nullptr;
@@ -391,6 +411,34 @@ static void * lt_scratch_get(lt_scratch & sc, size_t need) {
 static lt_state & lt_state_for(int device) {
     static lt_state s[GGML_CUDA_MAX_DEVICES];
     return s[device];
+}
+
+// [0] alpha, [1] beta = 0, [2] the largest block scale's bits, [4] the beta of 1 for a folded residual, allocated once per device
+static float * lt_scalars(lt_state & st) {
+    if (!st.scal) {
+        CUDA_CHECK(cudaMalloc(&st.scal, 8 * sizeof(float)));
+        const float ones[8] = { 0, 0, 0, 0, 1.0f, 0, 0, 0 };
+        CUDA_CHECK(cudaMemcpy(st.scal, ones, sizeof(ones), cudaMemcpyHostToDevice));
+    }
+    return st.scal;
+}
+
+static uint64_t lt_plan_key(int64_t M, int64_t N, int64_t K) {
+    return ((uint64_t) (M & 0xFFFFF) << 44) | ((uint64_t) (N & 0xFFFFFF) << 20) | (uint64_t) (K & 0xFFFFF);
+}
+
+// true the first time a reason (a string literal, compared by address) is seen on this device
+static bool lt_first_time(lt_state & st, const char * why) {
+    const int cap = (int) (sizeof(st.said) / sizeof(st.said[0]));
+    int i = 0;
+    while (i < st.n_said && st.said[i] != why) {
+        i++;
+    }
+    const bool first = i == st.n_said && st.n_said < cap;
+    if (first) {
+        st.said[st.n_said++] = why;
+    }
+    return first;
 }
 
 constexpr size_t LT_WORKSPACE = 32u << 20;
@@ -463,8 +511,7 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
     if (!st.handle && cublasLtCreate(&st.handle) != CUBLAS_STATUS_SUCCESS) {
         return false;
     }
-    const uint64_t key = ((uint64_t) (M & 0xFFFFF) << 44) | ((uint64_t) (N & 0xFFFFFF) << 20) | (uint64_t) (K & 0xFFFFF);
-    lt_plan & P = st.plans[key];
+    lt_plan & P = st.plans[lt_plan_key(M, N, K)];
     if (P.pref && !P.ok) {
         return false;   // this shape was tried and refused
     }
@@ -496,12 +543,7 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
     uint8_t * B   = (uint8_t *) lt_scratch_get(st.B, (size_t) N * K / 2);
     uint8_t * SFB = (uint8_t *) lt_scratch_get(st.SFB, sfb_size);
     char *    ws  = (char *) lt_scratch_get(st.ws, LT_WORKSPACE);
-    if (!st.scal) {
-        CUDA_CHECK(cudaMalloc(&st.scal, 8 * sizeof(float)));
-        const float ones[8] = { 0, 0, 0, 0, 1.0f, 0, 0, 0 };
-        CUDA_CHECK(cudaMemcpy(st.scal, ones, sizeof(ones), cudaMemcpyHostToDevice));
-    }
-    float * scal = st.scal;
+    float *   scal = lt_scalars(st);
     if (reuse) {
         k_alpha<<<1, 1, 0, stream>>>(reinterpret_cast<const unsigned *>(scal) + 2, w_gs, scal);
     } else {
@@ -666,12 +708,7 @@ int ggml_cuda_rms_norm_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgra
     uint8_t * SFB = (uint8_t *) lt_scratch_get(st.SFB, sfb_size);
     float *   d0  = (float *) lt_scratch_get(st.d0, (size_t) N * kblk * sizeof(float));
     float *   bmax = (float *) lt_scratch_get(st.bmax, (size_t) N * sizeof(float));
-    if (!st.scal) {
-        CUDA_CHECK(cudaMalloc(&st.scal, 8 * sizeof(float)));
-        const float ones[8] = { 0, 0, 0, 0, 1.0f, 0, 0, 0 };
-        CUDA_CHECK(cudaMemcpy(st.scal, ones, sizeof(ones), cudaMemcpyHostToDevice));
-    }
-    float * scal = st.scal;
+    float *   scal = lt_scalars(st);
     float eps = 0.0f;
     memcpy(&eps, norm->op_params, sizeof(float));
     CUDA_CHECK(cudaMemsetAsync(SFB, 0, sfb_size, stream));
@@ -690,6 +727,278 @@ int ggml_cuda_rms_norm_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgra
     st.q_N = N;
     st.q_K = K;
     return 1;
+}
+
+// The gated per-head norm before a GDN layer's output projection, matched at its RMS_NORM node: RMS_NORM(x) over 128-wide heads,
+// MUL(w), SILU(z), MUL, [RESHAPE], MUL_MAT(NVFP4 weight) in consecutive nodes, x [128, H, T, 1] and z of x's size both intact at
+// the norm. On a refusal why names the first condition the graph fails and at the node that fails it.
+struct gated_norm_match {
+    int                 n_nodes = 0;         // the chain's nodes before the matmul, 4 or 5 with the reshape, 0 on a refusal
+    const ggml_tensor * x       = nullptr;
+    const ggml_tensor * w       = nullptr;
+    const ggml_tensor * z       = nullptr;
+    const ggml_tensor * operand = nullptr;   // the matmul's src1: the join MUL or its reshape
+    const ggml_tensor * mm      = nullptr;
+    int64_t             hd      = 0;
+    int64_t             H       = 0;
+    int64_t             T       = 0;
+    float               eps     = 0.0f;
+    const char *        why     = nullptr;   // a literal, so a refusal is logged once per distinct reason
+    const ggml_tensor * at      = nullptr;
+};
+
+static const ggml_tensor * node_at(const ggml_cgraph * g, int i) {
+    return i >= 0 && i < g->n_nodes ? g->nodes[i] : nullptr;
+}
+
+// the other source of a binary node whose one source is `one`, nullptr when `one` is not a source of it
+static const ggml_tensor * other_src(const ggml_tensor * t, const ggml_tensor * one) {
+    return t == nullptr ? nullptr : t->src[0] == one ? t->src[1] : t->src[1] == one ? t->src[0] : nullptr;
+}
+
+static bool reads(const ggml_tensor * t, const ggml_tensor * one) {
+    int k = 0;
+    while (k < GGML_MAX_SRC && t->src[k] != one) {
+        k++;
+    }
+    return k < GGML_MAX_SRC;
+}
+
+// an F32 node with one reader inside the graph: its output may go unwritten when that reader is fused away
+static bool fusable_f32(const ggml_cgraph * g, int i) {
+    const ggml_tensor * t = g->nodes[i];
+    return t->type == GGML_TYPE_F32 && !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(g, i) == 1;
+}
+
+static bool aligned16(const ggml_tensor * t) {
+    return ggml_is_contiguous(t) && ((uintptr_t) t->data & 15) == 0;
+}
+
+// node i: the RMS_NORM over 128-wide heads of a token batch
+static const char * gated_norm_input(const ggml_cgraph * g, int i, gated_norm_match & m) {
+    const ggml_tensor * norm = node_at(g, i);
+    const ggml_tensor * x    = norm ? norm->src[0] : nullptr;
+    const char *        why  = nullptr;
+    if (norm == nullptr || norm->op != GGML_OP_RMS_NORM) {
+        why = "not an RMS_NORM";
+    } else if (x->type != GGML_TYPE_F32 || x->ne[0] != 128 || x->ne[3] != 1) {
+        why = "the norm is not over 128-wide F32 heads";
+    } else if (x->ne[2] < LT_MIN_TOKENS) {
+        why = "fewer than 16 tokens";
+    } else if (!fusable_f32(g, i) || !ggml_are_same_shape(x, norm) || !aligned16(x)) {
+        why = "the norm has another reader, another shape, or an input not contiguous and aligned";
+    }
+    if (why == nullptr) {
+        m.x = x; m.hd = x->ne[0]; m.H = x->ne[1]; m.T = x->ne[2];
+        memcpy(&m.eps, norm->op_params, sizeof(float));
+    }
+    m.at = why ? norm : nullptr;
+    return why;
+}
+
+// node i + 1: the MUL of the norm by its head-long weight
+static const char * gated_norm_weight(const ggml_cgraph * g, int i, gated_norm_match & m) {
+    const ggml_tensor * norm  = g->nodes[i];
+    const ggml_tensor * mul_w = node_at(g, i + 1);
+    const ggml_tensor * w     = other_src(mul_w, norm);
+    const char *        why   = nullptr;
+    if (mul_w == nullptr || mul_w->op != GGML_OP_MUL || w == nullptr) {
+        why = "the node after the norm is not a MUL of it";
+    } else if (w->type != GGML_TYPE_F32 || ggml_nelements(w) != m.hd || !aligned16(w)) {
+        why = "the norm's weight is not one contiguous F32 head";
+    } else if (!fusable_f32(g, i + 1) || !ggml_are_same_shape(norm, mul_w)) {
+        why = "the weight MUL has another reader or another shape";
+    }
+    m.w  = why ? nullptr : w;
+    m.at = why ? (mul_w ? mul_w : norm) : nullptr;
+    return why;
+}
+
+// node i + 2: the gate's SILU, over a z of x's size
+static const char * gated_norm_silu(const ggml_cgraph * g, int i, gated_norm_match & m) {
+    const ggml_tensor * silu = node_at(g, i + 2);
+    const ggml_tensor * z    = silu ? silu->src[0] : nullptr;
+    const char *        why  = nullptr;
+    if (silu == nullptr || silu->op != GGML_OP_UNARY || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU) {
+        why = "the node after the weight MUL is not the gate's SILU";
+    } else if (!fusable_f32(g, i + 2)) {
+        why = "the SILU has another reader";
+    } else if (z->type != GGML_TYPE_F32 || ggml_nelements(z) != ggml_nelements(m.x) || !aligned16(z)) {
+        why = "the gate z is not a contiguous F32 tensor of x's size";
+    }
+    m.z  = why ? nullptr : z;
+    m.at = why ? (silu ? silu : g->nodes[i + 1]) : nullptr;
+    return why;
+}
+
+// node i + 3: the MUL that joins the SILU with the normed tensor
+static const char * gated_norm_join(const ggml_cgraph * g, int i, gated_norm_match & m) {
+    const ggml_tensor * mul_w = g->nodes[i + 1];
+    const ggml_tensor * silu  = g->nodes[i + 2];
+    const ggml_tensor * mul2  = node_at(g, i + 3);
+    const char *        why   = nullptr;
+    if (mul2 == nullptr || mul2->op != GGML_OP_MUL || other_src(mul2, silu) != mul_w) {
+        why = "the node after the SILU is not the MUL that joins it with the normed tensor";
+    } else if (!fusable_f32(g, i + 3) || !ggml_are_same_shape(mul2, mul_w) || !aligned16(mul2)) {
+        why = "the join MUL has another reader or another shape";
+    }
+    m.at = why ? (mul2 ? mul2 : silu) : nullptr;
+    return why;
+}
+
+// node i + 4: the join MUL's reshape to [hd * H, T] when the graph has one, else the join MUL itself is the operand
+static const char * gated_norm_operand(const ggml_cgraph * g, int i, gated_norm_match & m) {
+    const ggml_tensor * mul2    = g->nodes[i + 3];
+    const ggml_tensor * next    = node_at(g, i + 4);
+    const bool          reshape = next && next->op == GGML_OP_RESHAPE && next->src[0] == mul2;
+    const ggml_tensor * operand = reshape ? next : mul2;
+    const char *        why     = nullptr;
+    if (reshape && ggml_node_get_use_count(g, i + 4) != 1) {
+        why = "the reshape has another reader";
+    } else if (operand->ne[0] != m.hd * m.H || operand->ne[1] != m.T || operand->ne[2] != 1 || operand->ne[3] != 1) {
+        why = "the matmul's operand is not [hd * H, T]";
+    }
+    m.operand = why ? nullptr : operand;
+    m.n_nodes = why ? 0 : (reshape ? 5 : 4);
+    m.at      = why ? operand : nullptr;
+    return why;
+}
+
+// node i + n_nodes: the NVFP4 matmul that reads the operand
+static const char * gated_norm_matmul(const ggml_cgraph * g, int i, gated_norm_match & m) {
+    const ggml_tensor * mm  = node_at(g, i + m.n_nodes);
+    const ggml_tensor * wt  = mm && mm->op == GGML_OP_MUL_MAT ? mm->src[0] : nullptr;
+    const int64_t       K   = m.hd * m.H;
+    const char *        why = nullptr;
+    if (wt == nullptr || mm->src[1] != m.operand) {
+        why = "the node after the join is not the matmul that reads it";
+    } else if (wt->type != GGML_TYPE_NVFP4 || wt->ne[0] != K || wt->ne[2] != 1 || wt->ne[3] != 1 || !ggml_is_contiguous(wt) ||
+               ggml_backend_buffer_get_usage(wt->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        why = "the matmul's weight is not an NVFP4 weight of K = hd * H";
+    }
+    m.mm      = why ? nullptr : mm;
+    m.n_nodes = why ? 0 : m.n_nodes;
+    m.at      = why ? (mm ? mm : m.operand) : nullptr;
+    return why;
+}
+
+static gated_norm_match gated_norm_match_at(const ggml_cgraph * g, int i) {
+    gated_norm_match m;
+    const char * w1 = gated_norm_input(g, i, m);
+    const char * w2 = w1 ? w1 : gated_norm_weight(g, i, m);
+    const char * w3 = w2 ? w2 : gated_norm_silu(g, i, m);
+    const char * w4 = w3 ? w3 : gated_norm_join(g, i, m);
+    const char * w5 = w4 ? w4 : gated_norm_operand(g, i, m);
+    m.why = w5 ? w5 : gated_norm_matmul(g, i, m);
+    return m;
+}
+
+// what the route needs beyond the graph: Blackwell, a cuBLASLt handle, and a plan the matmul's own first call made and kept,
+// so a parked operand is never left for an MMQ fallback to read as F32
+static const char * gated_norm_route_refusal(lt_state & st, const gated_norm_match & m) {
+    const auto   plan = st.plans.find(lt_plan_key(m.mm->src[0]->ne[1], m.T, m.hd * m.H));
+    const char * why  = nullptr;
+    if (!blackwell_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+        why = "no Blackwell tensor cores";
+    } else if (!st.handle && cublasLtCreate(&st.handle) != CUBLAS_STATUS_SUCCESS) {
+        why = "cuBLASLt gives no handle";
+    } else if (plan == st.plans.end() || !plan->second.pref) {
+        why = "the matmul's shape has no cuBLASLt plan yet, its own first call makes one";
+    } else if (!plan->second.ok) {
+        why = "cuBLASLt refused the matmul's shape";
+    }
+    return why;
+}
+
+// the gap between the weight MUL and the first reader of the normed tensor: how far that reader is, and which node before it,
+// if any, writes over x's memory (the allocator frees x after the norm, so a node between may land there)
+struct gated_norm_gap {
+    int                 join    = -1;
+    const ggml_tensor * clobber = nullptr;
+};
+
+static bool writes_over(const ggml_tensor * c, const ggml_tensor * x) {
+    const bool view = c->op == GGML_OP_VIEW || c->op == GGML_OP_RESHAPE || c->op == GGML_OP_PERMUTE || c->op == GGML_OP_TRANSPOSE ||
+                      c->op == GGML_OP_NONE || c->data == nullptr || c->buffer == nullptr || x->buffer == nullptr;
+    const uintptr_t xs = (uintptr_t) x->data, xe = xs + (view ? 0 : ggml_backend_buffer_get_alloc_size(x->buffer, x));
+    const uintptr_t cs = (uintptr_t) c->data, ce = cs + (view ? 0 : ggml_backend_buffer_get_alloc_size(c->buffer, c));
+    return !view && cs < xe && xs < ce;
+}
+
+static gated_norm_gap gated_norm_gap_at(const ggml_cgraph * g, int i, const ggml_tensor * x) {
+    const ggml_tensor * mul_w = g->nodes[i + 1];
+    gated_norm_gap      gap;
+    int j = i + 2;
+    while (j < g->n_nodes && !reads(g->nodes[j], mul_w)) {
+        j++;
+    }
+    int k = i + 2;
+    while (k < j && !writes_over(g->nodes[k], x)) {
+        k++;
+    }
+    gap.join    = j < g->n_nodes ? j - i : -1;
+    gap.clobber = k < j ? g->nodes[k] : nullptr;
+    return gap;
+}
+
+static void describe(char * buf, size_t n, const ggml_tensor * t) {
+    if (t) {
+        snprintf(buf, n, "%s %s ne=%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64, ggml_op_desc(t), t->name, t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+    } else {
+        snprintf(buf, n, "-");
+    }
+}
+
+static void gated_norm_say(const ggml_cgraph * g, int i, const gated_norm_match & m, const char * why) {
+    const gated_norm_gap gap = m.x ? gated_norm_gap_at(g, i, m.x) : gated_norm_gap();
+    char at[160], x[160], clobber[160];
+    describe(at, sizeof(at), m.at);
+    describe(x, sizeof(x), g->nodes[i]->src[0]);
+    describe(clobber, sizeof(clobber), gap.clobber);
+    GGML_LOG_INFO("nvfp4-lt gated norm stays plain: %s (at %s; x %s; the normed tensor's reader %d nodes after the norm; "
+                  "x overwritten before it by %s)\n", why, at, x, gap.join, clobber);
+}
+
+// silu(z) * rmsnorm(x) * w quantized to FP4 into the scratch and parked for the matmul at q_node + 1
+static void gated_norm_quantize(ggml_backend_cuda_context & ctx, lt_state & st, const gated_norm_match & m, const ggml_cgraph * cgraph, int q_node) {
+    const int64_t  N = m.T, K = m.hd * m.H, kblk = K / 16, kblk_pad = pad4(kblk);
+    const size_t   sfb_size = (size_t) pad128(N) * kblk_pad;
+    const unsigned nblocks  = (unsigned) ((N * (K / 128) + 7) / 8);
+    cudaStream_t   stream   = ctx.stream();
+    uint8_t * B    = (uint8_t *) lt_scratch_get(st.B, (size_t) N * K / 2);
+    uint8_t * SFB  = (uint8_t *) lt_scratch_get(st.SFB, sfb_size);
+    float *   d0   = (float *) lt_scratch_get(st.d0, (size_t) N * kblk * sizeof(float));
+    float *   bmax = (float *) lt_scratch_get(st.bmax, (size_t) nblocks * sizeof(float));
+    float *   scal = lt_scalars(st);
+    CUDA_CHECK(cudaMemsetAsync(SFB, 0, sfb_size, stream));
+    CUDA_CHECK(cudaMemsetAsync(scal, 0, 4 * sizeof(float), stream));
+    k_quant_pass1<3><<<nblocks, 256, 0, stream>>>((const float *) m.x->data, (const float *) m.z->data, (int) N, (int) K, B, d0, bmax,
+                                                  (const float *) m.w->data, m.eps);
+    k_quant_fold<<<1, 1024, 0, stream>>>(bmax, (int) nblocks, reinterpret_cast<unsigned *>(scal) + 2);
+    k_quant_pass2<<<(unsigned) ((N * kblk + 255) / 256), 256, 0, stream>>>(d0, (int) N, (int) K, reinterpret_cast<const unsigned *>(scal) + 2,
+        nullptr, SFB, (int) kblk_pad, scal);
+    CUDA_CHECK(cudaGetLastError());
+    st.q_graph = cgraph;
+    st.q_node  = q_node;
+    st.q_src1  = m.operand;
+    st.q_N = N;
+    st.q_K = K;
+}
+
+int ggml_cuda_gated_norm_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    lt_state &             st = lt_state_for(ggml_cuda_get_device());
+    const gated_norm_match m  = gated_norm_match_at(cgraph, node_idx);
+    const char *           why = m.why ? m.why : gated_norm_route_refusal(st, m);
+    if (why == nullptr) {
+        gated_norm_quantize(ctx, st, m, cgraph, node_idx + m.n_nodes - 1);
+        if (lt_first_time(st, "fused")) {
+            GGML_LOG_INFO("%s: gated per-head norms quantize straight to FP4 (first at hd=%" PRId64 " H=%" PRId64 " T=%" PRId64 ", %d nodes)\n",
+                          __func__, m.hd, m.H, m.T, m.n_nodes);
+        }
+    } else if (lt_first_time(st, why)) {
+        gated_norm_say(cgraph, node_idx, m, why);
+    }
+    return why == nullptr ? m.n_nodes - 1 : 0;
 }
 
 int ggml_cuda_mul_mat_nvfp4_lt_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
@@ -769,6 +1078,11 @@ void ggml_cuda_nvfp4_lt_note_node(const ggml_cgraph * cgraph, int node_idx) {
 }
 
 int ggml_cuda_rms_norm_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    GGML_UNUSED_VARS(ctx, cgraph, node_idx);
+    return 0;
+}
+
+int ggml_cuda_gated_norm_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED_VARS(ctx, cgraph, node_idx);
     return 0;
 }
