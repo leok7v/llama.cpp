@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmq-fuse.cuh"
+#include "ggml-cuda/mmq-nvfp4-lt.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -4747,6 +4748,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // MMQ operand fusions (mmq-fuse.cu): the node being computed, then a GEGLU whose only consumer is an MMQ matmul
     // (gelu(gate)*up quantized straight into its operand), gate/up/GEGLU/down as one fused GEMM + one matmul, and a
     // pre-norm whose every consumer is an MMQ matmul (normed straight into the operand, parked for them)
+    // NVFP4 weights on cuBLASLt's block-scaled FP4 path (mmq-nvfp4-lt.cu): the node being computed (for the shared-operand reuse),
+    // a matmul whose one-element MUL (the weight's global scale) folds into alpha, a GEGLU/SWIGLU quantized straight to FP4, and a
+    // pre-norm whose every consumer is such a matmul. Each hook launches nothing and returns 0 when its pattern does not qualify.
+    ggml_cuda_nvfp4_lt_note_node(cgraph, i);
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_NVFP4 && i + 1 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL) {
+        ggml_tensor *       mul = cgraph->nodes[i + 1];
+        const ggml_tensor * sc  = mul->src[0] == node ? mul->src[1] : (mul->src[1] == node ? mul->src[0] : nullptr);
+        if (sc && sc->type == GGML_TYPE_F32 && ggml_nelements(sc) == 1 && mul->type == GGML_TYPE_F32 && ggml_are_same_shape(mul, node) &&
+            ggml_is_contiguous(mul) && ggml_node_get_use_count(cgraph, i) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            const int out_nodes[] = { i + 1 };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1) &&
+                ggml_cuda_mul_mat_nvfp4_lt(*cuda_ctx, node->src[0], node->src[1], mul, sc)) {
+                return 1;
+            }
+        }
+    }
+    if (node->op == GGML_OP_GLU) {
+        const int n_extra_lt = ggml_cuda_mul_mat_nvfp4_lt_glu(*cuda_ctx, cgraph, i);
+        if (n_extra_lt > 0) {
+            return n_extra_lt;
+        }
+    }
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int n_extra_lt = ggml_cuda_rms_norm_nvfp4_lt(*cuda_ctx, cgraph, i);
+        if (n_extra_lt > 0) {
+            return n_extra_lt;
+        }
+    }
     ggml_cuda_mmq_fuse_note_node(cgraph, i);
     if (node->op == GGML_OP_GLU) {
         const int n_extra_mmq = ggml_cuda_mmq_fuse_glu(*cuda_ctx, cgraph, i);

@@ -6,6 +6,7 @@
 #include "mmq-q40-mma.cuh"
 #include "mmq-q80-mma.cuh"
 #include "mmq-q40-mma-id.cuh"
+#include "mmq-nvfp4-lt.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -201,6 +202,12 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(        nb10       == ts_src1);
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
+
+    // NVFP4 weights with a batch of tokens: cuBLASLt's block-scaled FP4 tensor-core GEMM when it takes the shape (mmq-nvfp4-lt.cu);
+    // the weight's global scale, when the graph fused its MUL, arrives through the dispatcher's own call, never here
+    if (!ids && !fused_add && ggml_cuda_mul_mat_nvfp4_lt(ctx, src0, src1, dst, nullptr)) {
+        return;
+    }
 
     const char  * src0_d = (const char  *) src0->data;
     const float * src1_d = (const float *) src1->data;
