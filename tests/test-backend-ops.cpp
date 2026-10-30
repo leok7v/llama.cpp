@@ -12388,6 +12388,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // 48 value heads (Qwen3.8-27B), a partial last chunk, and gates in the model's range so the state carries across chunks
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 512, 1, 3, false, false, 1, -0.5f));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 519, 1, 2, false, false, 1, -0.5f));
+    // five chunks, the shortest run of the whole-head path's producer and consumer warps
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 72, 1, 2, false, false, 1, -0.5f));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, false, true));
