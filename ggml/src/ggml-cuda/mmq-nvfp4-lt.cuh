@@ -16,6 +16,15 @@ bool ggml_cuda_mul_mat_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_tens
 // the pattern or the shape does not qualify (nothing launched).
 int ggml_cuda_mul_mat_nvfp4_lt_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
 
+// The dense FFN at cgraph->nodes[node_idx], its first NVFP4 matmul: gate and up (either order, each with its optional scale MUL),
+// their GLU, the NVFP4 down matmul, its optional scale MUL and residual ADD, as one group. The gate and up GEMMs write BF16 into
+// scratch, the GLU quantize reads BF16, and the F32 gate, up and GLU tensors of the graph are never written. _match returns the
+// index of the group's last node (-1 when the pattern or the shape does not qualify) and launches nothing; the dispatcher runs its
+// memory-range check over [node_idx, last] and then calls the run, which returns false, having launched nothing, when the BF16 plan
+// does not exist for the shape.
+int  ggml_cuda_ffn_nvfp4_lt_match(const ggml_cgraph * cgraph, int node_idx);
+bool ggml_cuda_ffn_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx, int last);
+
 // The dispatcher calls this before computing cgraph->nodes[node_idx]; it lets consecutive matmuls of one evaluation that read
 // the same src1 tensor share one FP4 quantization of it.
 void ggml_cuda_nvfp4_lt_note_node(const ggml_cgraph * cgraph, int node_idx);

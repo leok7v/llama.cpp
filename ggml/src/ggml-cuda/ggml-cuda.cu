@@ -4574,6 +4574,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // a matmul whose one-element MUL (the weight's global scale) folds into alpha, a GEGLU/SWIGLU quantized straight to FP4, and a
     // pre-norm whose every consumer is such a matmul. Each hook launches nothing and returns 0 when its pattern does not qualify.
     ggml_cuda_nvfp4_lt_note_node(cgraph, i);
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_NVFP4) {
+        // the dense FFN as one group first (gate and up with BF16 outputs, the GLU quantize from BF16, the down GEMM)
+        // (the group writes graph memory once, the down GEMM's output; its own aliasing rule is in the match, so the generic
+        // memory-range check, which refuses any source that shares memory with the output, does not apply)
+        const int last = ggml_cuda_ffn_nvfp4_lt_match(cgraph, i);
+        if (last > i && ggml_cuda_ffn_nvfp4_lt(*cuda_ctx, cgraph, i, last)) {
+            return last - i;
+        }
+    }
     if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_NVFP4 && i + 1 < cgraph->n_nodes) {
         // the chain behind an NVFP4 matmul: [MUL by its one-element scale] [ADD of a same-shape residual]; the scale folds into
         // alpha, the residual into beta * C, and the last node of the chain is the GEMM's output

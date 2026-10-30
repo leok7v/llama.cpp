@@ -24,9 +24,15 @@
 //     dispatcher notes the node being computed (ggml_cuda_nvfp4_lt_note_node) and a later node with the same src1 object
 //     reuses the FP4 operand in the scratch, recomputing only alpha for its own weight scale;
 //   - a pre-norm (RMS_NORM + weight MUL) whose every consumer is such a matmul is written straight to FP4 by one kernel
-//     (ggml_cuda_rms_norm_nvfp4_lt): the F32 normed activation never exists in memory either.
+//     (ggml_cuda_rms_norm_nvfp4_lt): the F32 normed activation never exists in memory either;
+//   - a dense FFN, gate [MUL] up [MUL] GLU down [MUL] [ADD], runs as one group (ggml_cuda_ffn_nvfp4_lt): the gate and up GEMMs
+//     write BF16 into two scratch slabs, the GLU quantize reads BF16, and the graph's F32 gate, up and GLU tensors are never
+//     written (the F32 round trip was 71 MB per layer on the 27B). BF16, not F16: an F16 output overflowed
+//     on the largest pre-activations of the 27B and moved its perplexity by one percent (2026-10-30), and the values become
+//     FP4 right after, so BF16's eight mantissa bits lose nothing that FP4 keeps.
 #include "mmq-nvfp4-lt.cuh"
 #include "unary.cuh"   // ggml_cuda_op_gelu_single: the same tanh gelu the GLU kernel applies
+#include <cuda_bf16.h>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
 #define GGML_CUDA_NVFP4_LT 1
@@ -91,8 +97,17 @@ static __device__ __forceinline__ float round_to_ue4m3_mantissa(float d) {
 // with an unbounded exponent (so the later division by a power-of-two tensor scale is exact); E2M1 values quantized against d0.
 // GEGLU: X is the gate and G the up projection, the value quantized is gelu(x) * g (ggml's tanh gelu, bit-identical to the GLU op).
 // K must be a multiple of 128 (every gemma width is); the caller checks.
-template <int GLU>   // 0: x; 1: gelu(x) * g (gemma's GEGLU); 2: silu(x) * g (Qwen's SWIGLU)
-static __global__ void k_quant_pass1(const float * __restrict__ X, const float * __restrict__ G, int N, int K, uint8_t * __restrict__ B,
+// the activation is F32 (the graph's tensors) or BF16 (the FFN group's gate and up slabs): four values per lane either way
+template <typename T> static __device__ __forceinline__ float4 lt_load4(const T * p, int i);
+template <> __device__ __forceinline__ float4 lt_load4<float>(const float * p, int i) { return reinterpret_cast<const float4 *>(p)[i]; }
+template <> __device__ __forceinline__ float4 lt_load4<nv_bfloat16>(const nv_bfloat16 * p, int i) {
+    const uint2  raw = reinterpret_cast<const uint2 *>(p)[i];
+    const float2 a   = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162 *>(&raw.x));
+    const float2 b   = __bfloat1622float2(*reinterpret_cast<const nv_bfloat162 *>(&raw.y));
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+template <int GLU, typename T>   // 0: x; 1: gelu(x) * g (gemma's GEGLU); 2: silu(x) * g (Qwen's SWIGLU)
+static __global__ void k_quant_pass1(const T * __restrict__ X, const T * __restrict__ G, int N, int K, uint8_t * __restrict__ B,
                                      float * __restrict__ d0s, float * __restrict__ bmax) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int warps_per_block = blockDim.x >> 5;
@@ -102,15 +117,15 @@ static __global__ void k_quant_pass1(const float * __restrict__ X, const float *
     float d0 = 0.0f;
     if (n < N) {   // no early return: the warp shuffles below need every lane
         const size_t off = (size_t) n * K + (size_t) ch * 128;
-        float4 v = reinterpret_cast<const float4 *>(X + off)[lane];
+        float4 v = lt_load4<T>(X + off, lane);
         if constexpr (GLU == 1) {
-            const float4 g = reinterpret_cast<const float4 *>(G + off)[lane];
+            const float4 g = lt_load4<T>(G + off, lane);
             v.x = ggml_cuda_op_gelu_single(v.x) * g.x;
             v.y = ggml_cuda_op_gelu_single(v.y) * g.y;
             v.z = ggml_cuda_op_gelu_single(v.z) * g.z;
             v.w = ggml_cuda_op_gelu_single(v.w) * g.w;
         } else if constexpr (GLU == 2) {
-            const float4 g = reinterpret_cast<const float4 *>(G + off)[lane];
+            const float4 g = lt_load4<T>(G + off, lane);
             v.x = ggml_cuda_op_silu_single(v.x) * g.x;   // unary_gated_op_kernel<op_silu>: op(x) * g
             v.y = ggml_cuda_op_silu_single(v.y) * g.y;
             v.z = ggml_cuda_op_silu_single(v.z) * g.z;
@@ -349,8 +364,10 @@ static void lt_tune_store(int64_t M, int64_t N, int64_t K, int cc, int idx) {
 struct lt_state {
     cublasLtHandle_t                                 handle = nullptr;
     std::unordered_map<const void *, lt_repacked>    weights;
-    std::unordered_map<uint64_t, lt_plan>            plans;
+    std::unordered_map<uint64_t, lt_plan>            plans;      // F32 output
+    std::unordered_map<uint64_t, lt_plan>            plans16;    // BF16 output (the FFN group's gate and up GEMMs)
     lt_scratch                                       B, SFB, ws, d0, bmax;   // grown on demand; stream order makes reuse safe
+    lt_scratch                                       g16, u16;   // the FFN group's gate and up outputs, BF16, N x n_ff each
     float *                                          scal = nullptr;   // [0] alpha, [1] beta = 0, [2] max block scale bits
     bool                                             announced = false;
     bool                                             warned    = false;
@@ -385,7 +402,7 @@ static lt_state & lt_state_for(int device) {
 
 constexpr size_t LT_WORKSPACE = 32u << 20;
 
-static bool lt_make_plan(lt_state & st, lt_plan & P, int64_t M, int64_t N, int64_t K, const void * sfa, const void * sfb) {
+static bool lt_make_plan(lt_state & st, lt_plan & P, int64_t M, int64_t N, int64_t K, const void * sfa, const void * sfb, bool d_f16) {
     const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;   // narrow types want TN: both operands K-contiguous
     const cublasLtMatmulMatrixScale_t sm = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
     const cublasLtPointerMode_t pm = CUBLASLT_POINTER_MODE_DEVICE;
@@ -400,9 +417,15 @@ static bool lt_make_plan(lt_state & st, lt_plan & P, int64_t M, int64_t N, int64
     ok = ok && cublasLtMatmulDescSetAttribute(P.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sfb, sizeof(sfb)) == CUBLAS_STATUS_SUCCESS;
     ok = ok && cublasLtMatrixLayoutCreate(&P.Al, CUDA_R_4F_E2M1, K, M, K) == CUBLAS_STATUS_SUCCESS;
     ok = ok && cublasLtMatrixLayoutCreate(&P.Bl, CUDA_R_4F_E2M1, K, N, K) == CUBLAS_STATUS_SUCCESS;
-    ok = ok && cublasLtMatrixLayoutCreate(&P.Dl, CUDA_R_32F, M, N, M) == CUBLAS_STATUS_SUCCESS;
+    ok = ok && cublasLtMatrixLayoutCreate(&P.Dl, d_f16 ? CUDA_R_16BF : CUDA_R_32F, M, N, M) == CUBLAS_STATUS_SUCCESS;
     ok = ok && cublasLtMatmulPreferenceCreate(&P.pref) == CUBLAS_STATUS_SUCCESS;
     ok = ok && cublasLtMatmulPreferenceSetAttribute(P.pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &LT_WORKSPACE, sizeof(LT_WORKSPACE)) == CUBLAS_STATUS_SUCCESS;
+    if (d_f16) {
+        // a 16-bit D must not be the split-K reduction's type: partial sums kept in 8 or 11 mantissa bits moved the 27B's perplexity
+        // by 3 and 1 percent (2026-10-30, the F32-slab control was exact), so the candidates reduce in the compute type or not at all
+        const uint32_t rs = CUBLASLT_REDUCTION_SCHEME_NONE | CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+        ok = ok && cublasLtMatmulPreferenceSetAttribute(P.pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &rs, sizeof(rs)) == CUBLAS_STATUS_SUCCESS;
+    }
     if (ok) {
         const cublasStatus_t hs = cublasLtMatmulAlgoGetHeuristic(st.handle, P.op, P.Al, P.Bl, P.Dl, P.Dl, P.pref, 16, P.heur, &P.n_heur);
         ok = hs == CUBLAS_STATUS_SUCCESS && P.n_heur > 0;
@@ -411,7 +434,7 @@ static bool lt_make_plan(lt_state & st, lt_plan & P, int64_t M, int64_t N, int64
     return ok;
 }
 
-static cublasStatus_t lt_matmul(lt_state & st, lt_plan & P, int which, const float * scal, const uint8_t * A, const uint8_t * B, float * D,
+static cublasStatus_t lt_matmul(lt_state & st, lt_plan & P, int which, const float * scal, const uint8_t * A, const uint8_t * B, void * D,
                          char * ws, size_t ws_size, cudaStream_t stream, const float * res = nullptr) {
     // res: a same-shape residual folded in as beta * C with beta = 1 (scal[4], written once), the separate ADD kernel gone
     return cublasLtMatmul(st.handle, P.op, scal, A, P.Al, B, P.Bl, res ? scal + 4 : scal + 1, res ? res : D, P.Dl, D, P.Dl, &P.heur[which].algo, ws, ws_size, stream);
@@ -419,12 +442,13 @@ static cublasStatus_t lt_matmul(lt_state & st, lt_plan & P, int which, const flo
 
 } // namespace
 
-// src1 gives the activation SHAPE (and, with act1 == nullptr, the data); with act1 set the activation is gelu(act0) * act1,
-// the GEGLU of two matmul outputs of src1's shape that never needs to exist in memory.
-static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                       ggml_tensor * dst, const ggml_tensor * x_scale, const float * act0, const float * act1, const int glu = 0,
-                       const float * res = nullptr) {
-    if (src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+// src1 gives the activation SHAPE (and, with act1 == nullptr, the data); with act1 set the activation is act(act0) * act1,
+// the GLU of two matmul outputs of src1's shape that never needs to exist in memory. act_f16: act0 and act1 are F16 (the FFN
+// group's slabs). D is the output, F32 unless d_f16; dst gives its contiguity and is the graph's tensor for the F32 case.
+static bool lt_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+                    const ggml_tensor * x_scale, const void * act0, const void * act1, bool act_f16, int glu, void * D, bool d_f16,
+                    const float * res) {
+    if (src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 || (!d_f16 && dst->type != GGML_TYPE_F32)) {
         return false;
     }
     const int id = ggml_cuda_get_device();
@@ -454,7 +478,8 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
         return false;
     }
     const uint64_t key = ((uint64_t) (M & 0xFFFFF) << 44) | ((uint64_t) (N & 0xFFFFFF) << 20) | (uint64_t) (K & 0xFFFFF);
-    lt_plan & P = st.plans[key];
+    lt_plan & P = d_f16 ? st.plans16[key] : st.plans[key];
+    const int tune_cc = d_f16 ? cc + 200000 : cc;   // the tune file keys the BF16-output plans apart with an offset on cc (200000: the masked candidate list)
     if (P.pref && !P.ok) {
         return false;   // this shape was tried and refused
     }
@@ -501,12 +526,16 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
         const int64_t nq = N * kblk;
         const unsigned nblocks = (unsigned) ((N * (K / 128) + 7) / 8);   // a warp per 128 values, 8 warps per block
         float * bmax = (float *) lt_scratch_get(st.bmax, (size_t) nblocks * sizeof(float));
-        if (act1 && glu == 2) {
-            k_quant_pass1<2><<<nblocks, 256, 0, stream>>>(act0, act1, (int) N, (int) K, B, d0, bmax);
+        if (act1 && act_f16 && glu == 2) {
+            k_quant_pass1<2, nv_bfloat16><<<nblocks, 256, 0, stream>>>((const nv_bfloat16 *) act0, (const nv_bfloat16 *) act1, (int) N, (int) K, B, d0, bmax);
+        } else if (act1 && act_f16) {
+            k_quant_pass1<1, nv_bfloat16><<<nblocks, 256, 0, stream>>>((const nv_bfloat16 *) act0, (const nv_bfloat16 *) act1, (int) N, (int) K, B, d0, bmax);
+        } else if (act1 && glu == 2) {
+            k_quant_pass1<2, float><<<nblocks, 256, 0, stream>>>((const float *) act0, (const float *) act1, (int) N, (int) K, B, d0, bmax);
         } else if (act1) {
-            k_quant_pass1<1><<<nblocks, 256, 0, stream>>>(act0, act1, (int) N, (int) K, B, d0, bmax);
+            k_quant_pass1<1, float><<<nblocks, 256, 0, stream>>>((const float *) act0, (const float *) act1, (int) N, (int) K, B, d0, bmax);
         } else {
-            k_quant_pass1<0><<<nblocks, 256, 0, stream>>>(act0, nullptr, (int) N, (int) K, B, d0, bmax);
+            k_quant_pass1<0, float><<<nblocks, 256, 0, stream>>>((const float *) act0, nullptr, (int) N, (int) K, B, d0, bmax);
         }
         k_quant_fold<<<1, 1024, 0, stream>>>(bmax, (int) nblocks, reinterpret_cast<unsigned *>(scal) + 2);
         k_quant_pass2<<<(unsigned) ((nq + 255) / 256), 256, 0, stream>>>(d0, (int) N, (int) K, reinterpret_cast<const unsigned *>(scal) + 2,
@@ -522,9 +551,9 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
 
     const void * sfa = w.SF;
     const void * sfb = SFB;
-    if (!P.pref && !lt_make_plan(st, P, M, N, K, sfa, sfb)) {
+    if (!P.pref && !lt_make_plan(st, P, M, N, K, sfa, sfb, d_f16)) {
         if (!st.warned) {
-            GGML_LOG_WARN("%s: cuBLASLt has no block-scaled FP4 algorithm for M=%" PRId64 " N=%" PRId64 " K=%" PRId64 ", MMQ runs it\n", __func__, M, N, K);
+            GGML_LOG_WARN("%s: cuBLASLt has no block-scaled FP4 algorithm for M=%" PRId64 " N=%" PRId64 " K=%" PRId64 "%s, MMQ runs it\n", __func__, M, N, K, d_f16 ? " (BF16 out)" : "");
             st.warned = true;
         }
         return false;
@@ -537,12 +566,10 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
         cublasLtMatmulDescSetAttribute(P.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sfb, sizeof(sfb)) != CUBLAS_STATUS_SUCCESS) {
         return false;
     }
-    float * D = (float *) dst->data;
-
     // first call for this shape: time every heuristic candidate on the real operands and keep the fastest (the operands
     // are consumed identically by each, so D holds the right result whichever ran last). Skipped under graph capture.
     if (!P.tuned) {
-        const int remembered = lt_tune_lookup(M, N, K, cc);
+        const int remembered = lt_tune_lookup(M, N, K, tune_cc);
         if (remembered >= 0 && remembered < P.n_heur) {
             P.best  = remembered;
             P.tuned = true;
@@ -576,7 +603,7 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
             CUDA_CHECK(cudaEventDestroy(e0));
             CUDA_CHECK(cudaEventDestroy(e1));
             P.tuned = true;
-            lt_tune_store(M, N, K, cc, P.best);
+            lt_tune_store(M, N, K, tune_cc, P.best);
         }
     }
     const cublasStatus_t s = lt_matmul(st, P, P.best, scal, w.A, B, D, ws, LT_WORKSPACE, stream, res);
@@ -590,9 +617,208 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
     return true;
 }
 
+static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                       ggml_tensor * dst, const ggml_tensor * x_scale, const float * act0, const float * act1, const int glu = 0,
+                       const float * res = nullptr) {
+    return lt_gemm(ctx, src0, src1, dst, x_scale, act0, act1, false, glu, dst->data, false, res);
+}
+
 bool ggml_cuda_mul_mat_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                 ggml_tensor * dst, const ggml_tensor * x_scale, const ggml_tensor * res) {
     return lt_mul_mat(ctx, src0, src1, dst, x_scale, (const float *) src1->data, nullptr, 0, res ? (const float *) res->data : nullptr);
+}
+
+// The dense FFN as one group, matched at its first matmul: two NVFP4 matmuls that read the same src1 (gate and up, in either
+// order, each with its optional one-element scale MUL), the GLU of their outputs, the NVFP4 down matmul that consumes the GLU,
+// its optional scale MUL and its optional residual ADD. The gate and up GEMMs write F16 into the scratch slabs, the GLU quantize
+// reads them, and the down GEMM lands in the graph's last tensor of the chain. Returns the extra nodes consumed, 0 when the pattern
+// or a plan does not qualify (nothing launched: the F16 plan is made before the first kernel). The match and the run are two
+// calls, because the dispatcher's memory-range check sits between them.
+namespace {
+struct ffn_pattern {
+    int igate = -1, iup = -1, ig = -1, idown = -1, last = -1;
+    const ggml_tensor * scg = nullptr, * scu = nullptr, * scd = nullptr, * res = nullptr;
+    ggml_tensor * out = nullptr;
+    ggml_glu_op glu_op = GGML_GLU_OP_COUNT;
+};
+static bool ffn_match(const ggml_cgraph * cgraph, int node_idx, ffn_pattern & F) {
+    const int n = cgraph->n_nodes;
+    auto is_nvfp4_mm = [&](const ggml_tensor * t) {
+        return t->op == GGML_OP_MUL_MAT && t->src[0]->type == GGML_TYPE_NVFP4 && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+               !(t->flags & GGML_TENSOR_FLAG_OUTPUT);
+    };
+    // a one-element scale MUL right after node j whose only use is that MUL: returns the MUL's index, else j
+    auto scale_after = [&](int j, const ggml_tensor *& sc) -> int {
+        sc = nullptr;
+        if (j + 1 >= n) {
+            return j;
+        }
+        const ggml_tensor * t = cgraph->nodes[j], * m = cgraph->nodes[j + 1];
+        if (m->op == GGML_OP_MUL && m->type == GGML_TYPE_F32 && (m->src[0] == t || m->src[1] == t) && ggml_are_same_shape(m, t) &&
+            ggml_is_contiguous(m) && ggml_node_get_use_count(cgraph, j) == 1 && !(m->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            const ggml_tensor * o = m->src[0] == t ? m->src[1] : m->src[0];
+            if (o->type == GGML_TYPE_F32 && ggml_nelements(o) == 1) {
+                sc = o;
+                return j + 1;
+            }
+        }
+        return j;
+    };
+    const int ia = node_idx;
+    if (ia + 3 >= n || !is_nvfp4_mm(cgraph->nodes[ia])) {
+        return false;
+    }
+    const ggml_tensor * sca = nullptr, * scb = nullptr, * scd = nullptr;
+    const int ea = scale_after(ia, sca);            // chain A ends here
+    const int ib = ea + 1;
+    if (ib + 2 >= n || !is_nvfp4_mm(cgraph->nodes[ib]) || cgraph->nodes[ib]->src[1] != cgraph->nodes[ia]->src[1]) {
+        return false;
+    }
+    const int eb = scale_after(ib, scb);            // chain B ends here
+    const int ig = eb + 1;
+    if (ig + 1 >= n) {
+        return false;
+    }
+    const ggml_tensor * glu = cgraph->nodes[ig];
+    const ggml_glu_op glu_op = glu->op == GGML_OP_GLU ? ggml_get_glu_op(glu) : GGML_GLU_OP_COUNT;
+    if (glu->op != GGML_OP_GLU || (glu_op != GGML_GLU_OP_GEGLU && glu_op != GGML_GLU_OP_SWIGLU) || glu->src[1] == nullptr ||
+        ((const int32_t *) glu->op_params)[1] != 0 /* swapped */ || glu->type != GGML_TYPE_F32 || !ggml_is_contiguous(glu) ||
+        (glu->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * outa = cgraph->nodes[ea], * outb = cgraph->nodes[eb];
+    if (ggml_node_get_use_count(cgraph, ea) != 1 || ggml_node_get_use_count(cgraph, eb) != 1 || ggml_node_get_use_count(cgraph, ig) != 1 ||
+        (outa->flags & GGML_TENSOR_FLAG_OUTPUT) || (outb->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+        !ggml_are_same_shape(outa, glu) || !ggml_are_same_shape(outb, glu)) {
+        return false;
+    }
+    // which chain is the gate (the GLU's src0) and which the up (src1)
+    int igate, iup;
+    const ggml_tensor * scg, * scu;
+    if (glu->src[0] == outa && glu->src[1] == outb) {
+        igate = ia; iup = ib; scg = sca; scu = scb;
+    } else if (glu->src[0] == outb && glu->src[1] == outa) {
+        igate = ib; iup = ia; scg = scb; scu = sca;
+    } else {
+        return false;
+    }
+    const ggml_tensor * gate = cgraph->nodes[igate], * up = cgraph->nodes[iup];
+    // the down matmul and its chain
+    const int id_ = ig + 1;
+    const ggml_tensor * down = cgraph->nodes[id_];
+    if (!is_nvfp4_mm(down) || down->src[1] != glu) {
+        return false;
+    }
+    int last = scale_after(id_, scd);
+    ggml_tensor * out = cgraph->nodes[last];
+    const ggml_tensor * res = nullptr;
+    if (last + 1 < n) {
+        const ggml_tensor * add = cgraph->nodes[last + 1];
+        if (add->op == GGML_OP_ADD && add->type == GGML_TYPE_F32 && (add->src[0] == out || add->src[1] == out) &&
+            ggml_are_same_shape(add, out) && ggml_is_contiguous(add) && !(out->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_node_get_use_count(cgraph, last) == 1) {
+            const ggml_tensor * other = add->src[0] == out ? add->src[1] : add->src[0];
+            if (other != out && other->type == GGML_TYPE_F32 && ggml_is_contiguous(other) && ggml_are_same_shape(other, out)) {
+                res = other;
+                last += 1;
+                out = cgraph->nodes[last];
+            }
+        }
+    }
+    // the shapes: gate and up share M (n_ff) and K (n_embd)
+    const ggml_tensor * x = gate->src[1];
+    if (gate->src[0]->ne[1] != up->src[0]->ne[1] || gate->src[0]->ne[0] != up->src[0]->ne[0] || x->ne[1] < LT_MIN_TOKENS ||
+        x->ne[0] % 128 != 0 || gate->src[0]->ne[1] % 128 != 0 || x->ne[2] != 1 || x->ne[3] != 1 ||
+        ggml_backend_buffer_get_usage(gate->src[0]->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        ggml_backend_buffer_get_usage(up->src[0]->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        ggml_backend_buffer_get_usage(down->src[0]->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return false;
+    }
+    if (res) {
+        const int64_t os = (int64_t) out->data, oe = os + (int64_t) ggml_backend_buffer_get_alloc_size(out->buffer, out);
+        const int64_t rs = (int64_t) res->data, re = rs + (int64_t) ggml_backend_buffer_get_alloc_size(res->buffer, res);
+        const bool overlap = (rs <= os && os < re) || (os <= rs && rs < oe);
+        if (overlap && res->data != out->data) {
+            return false;   // cuBLASLt wants C and D equal or apart
+        }
+    }
+    F.igate = igate; F.iup = iup; F.ig = ig; F.idown = id_; F.last = last;
+    F.scg = scg; F.scu = scu; F.scd = scd; F.res = res; F.out = out; F.glu_op = glu_op;
+    return true;
+}
+} // namespace
+
+int ggml_cuda_ffn_nvfp4_lt_match(const ggml_cgraph * cgraph, int node_idx) {
+    ffn_pattern F;
+    return ffn_match(cgraph, node_idx, F) ? F.last : -1;
+}
+
+bool ggml_cuda_ffn_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx, int last) {
+    ffn_pattern F;
+    if (!ffn_match(cgraph, node_idx, F) || F.last != last) {
+        return false;
+    }
+    const ggml_tensor * gate = cgraph->nodes[F.igate], * up = cgraph->nodes[F.iup], * glu = cgraph->nodes[F.ig], * down = cgraph->nodes[F.idown];
+    const ggml_tensor * x = gate->src[1];
+    const int igate = F.igate, iup = F.iup, id_ = F.idown;
+    const ggml_tensor * scg = F.scg, * scu = F.scu, * scd = F.scd, * res = F.res;
+    ggml_tensor * out = F.out;
+    const ggml_glu_op glu_op = F.glu_op;
+    const int dev = ggml_cuda_get_device();
+    const int cc  = ggml_cuda_info().devices[dev].cc;
+    if (!blackwell_mma_available(cc)) {
+        return false;
+    }
+    lt_state & st = lt_state_for(dev);
+    if (!st.handle && cublasLtCreate(&st.handle) != CUBLAS_STATUS_SUCCESS) {
+        return false;
+    }
+    const int64_t M = gate->src[0]->ne[1], K = x->ne[0], N = x->ne[1];
+    {
+        const uint64_t key = ((uint64_t) (M & 0xFFFFF) << 44) | ((uint64_t) (N & 0xFFFFFF) << 20) | (uint64_t) (K & 0xFFFFF);
+        lt_plan & P = st.plans16[key];
+        if (P.pref && !P.ok) {
+            return false;   // no F16-output algorithm for this shape: the per-node hooks run the FFN as before
+        }
+        if (!P.pref) {
+            // the plan needs scale pointers to validate; the real ones are set per call, any valid device pointers do here
+            uint8_t * SFB = (uint8_t *) lt_scratch_get(st.SFB, (size_t) pad128(N) * pad4(K / 16));
+            if (!lt_make_plan(st, P, M, N, K, SFB, SFB, true)) {
+                static bool said = false;
+                if (!said) {
+                    GGML_LOG_WARN("%s: cuBLASLt has no BF16-output block-scaled FP4 algorithm for M=%" PRId64 " N=%" PRId64 " K=%" PRId64 ", the FFN runs node by node\n", __func__, M, N, K);
+                    said = true;
+                }
+                return false;
+            }
+        }
+        static bool announced = false;
+        if (!announced) {
+            GGML_LOG_INFO("%s: dense FFN groups run with BF16 gate/up outputs (first at M=%" PRId64 " N=%" PRId64 " K=%" PRId64 ")\n", __func__, M, N, K);
+            announced = true;
+        }
+    }
+    const size_t slab = (size_t) N * M * sizeof(nv_bfloat16);
+    nv_bfloat16 * g16 = (nv_bfloat16 *) lt_scratch_get(st.g16, slab);
+    nv_bfloat16 * u16 = (nv_bfloat16 *) lt_scratch_get(st.u16, slab);
+    // the gate and the up GEMMs, F16 out; the second reuses the FP4 operand of the first (same src1, a later node)
+    ggml_cuda_nvfp4_lt_note_node(cgraph, igate);
+    if (!lt_gemm(ctx, gate->src[0], x, gate, scg, x->data, nullptr, false, 0, g16, true, nullptr)) {
+        return false;
+    }
+    ggml_cuda_nvfp4_lt_note_node(cgraph, iup);
+    if (!lt_gemm(ctx, up->src[0], x, up, scu, x->data, nullptr, false, 0, u16, true, nullptr)) {
+        GGML_ABORT("%s: the up GEMM refused a shape its gate twin took (M=%" PRId64 " N=%" PRId64 " K=%" PRId64 ")", __func__, M, N, K);
+    }
+    // the GLU quantized from the two slabs, then the down GEMM into the chain's last tensor
+    ggml_cuda_nvfp4_lt_note_node(cgraph, id_);
+    if (!lt_gemm(ctx, down->src[0], glu, out, scd, g16, u16, true, glu_op == GGML_GLU_OP_SWIGLU ? 2 : 1, out->data, false,
+                 res ? (const float *) res->data : nullptr)) {
+        GGML_ABORT("%s: the down GEMM refused after the gate and up ran (M=%" PRId64 " N=%" PRId64 " K=%" PRId64 ")", __func__,
+                   down->src[0]->ne[1], N, M);
+    }
+    GGML_UNUSED(glu);
+    return true;
 }
 
 void ggml_cuda_nvfp4_lt_note_node(const ggml_cgraph * cgraph, int node_idx) {
@@ -752,6 +978,16 @@ bool ggml_cuda_mul_mat_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_tens
 int ggml_cuda_mul_mat_nvfp4_lt_glu(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED_VARS(ctx, cgraph, node_idx);
     return 0;
+}
+
+int ggml_cuda_ffn_nvfp4_lt_match(const ggml_cgraph * cgraph, int node_idx) {
+    GGML_UNUSED_VARS(cgraph, node_idx);
+    return -1;
+}
+
+bool ggml_cuda_ffn_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx, int last) {
+    GGML_UNUSED_VARS(ctx, cgraph, node_idx, last);
+    return false;
 }
 
 void ggml_cuda_nvfp4_lt_note_node(const ggml_cgraph * cgraph, int node_idx) {
