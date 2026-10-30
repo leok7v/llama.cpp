@@ -412,8 +412,9 @@ static bool lt_make_plan(lt_state & st, lt_plan & P, int64_t M, int64_t N, int64
 }
 
 static cublasStatus_t lt_matmul(lt_state & st, lt_plan & P, int which, const float * scal, const uint8_t * A, const uint8_t * B, float * D,
-                         char * ws, size_t ws_size, cudaStream_t stream) {
-    return cublasLtMatmul(st.handle, P.op, scal, A, P.Al, B, P.Bl, scal + 1, D, P.Dl, D, P.Dl, &P.heur[which].algo, ws, ws_size, stream);
+                         char * ws, size_t ws_size, cudaStream_t stream, const float * res = nullptr) {
+    // res: a same-shape residual folded in as beta * C with beta = 1 (scal[4], written once), the separate ADD kernel gone
+    return cublasLtMatmul(st.handle, P.op, scal, A, P.Al, B, P.Bl, res ? scal + 4 : scal + 1, res ? res : D, P.Dl, D, P.Dl, &P.heur[which].algo, ws, ws_size, stream);
 }
 
 } // namespace
@@ -421,7 +422,8 @@ static cublasStatus_t lt_matmul(lt_state & st, lt_plan & P, int which, const flo
 // src1 gives the activation SHAPE (and, with act1 == nullptr, the data); with act1 set the activation is gelu(act0) * act1,
 // the GEGLU of two matmul outputs of src1's shape that never needs to exist in memory.
 static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                       ggml_tensor * dst, const ggml_tensor * x_scale, const float * act0, const float * act1, const int glu = 0) {
+                       ggml_tensor * dst, const ggml_tensor * x_scale, const float * act0, const float * act1, const int glu = 0,
+                       const float * res = nullptr) {
     if (src0->type != GGML_TYPE_NVFP4 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
@@ -485,7 +487,9 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
     uint8_t * SFB = (uint8_t *) lt_scratch_get(st.SFB, sfb_size);
     char *    ws  = (char *) lt_scratch_get(st.ws, LT_WORKSPACE);
     if (!st.scal) {
-        CUDA_CHECK(cudaMalloc(&st.scal, 4 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&st.scal, 8 * sizeof(float)));
+        const float ones[8] = { 0, 0, 0, 0, 1.0f, 0, 0, 0 };
+        CUDA_CHECK(cudaMemcpy(st.scal, ones, sizeof(ones), cudaMemcpyHostToDevice));
     }
     float * scal = st.scal;
     if (reuse) {
@@ -575,7 +579,7 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
             lt_tune_store(M, N, K, cc, P.best);
         }
     }
-    const cublasStatus_t s = lt_matmul(st, P, P.best, scal, w.A, B, D, ws, LT_WORKSPACE, stream);
+    const cublasStatus_t s = lt_matmul(st, P, P.best, scal, w.A, B, D, ws, LT_WORKSPACE, stream, res);
     if (s != CUBLAS_STATUS_SUCCESS) {
         if (!st.warned) {
             GGML_LOG_WARN("%s: cublasLtMatmul failed (%d) for M=%" PRId64 " N=%" PRId64 " K=%" PRId64 ", MMQ runs it\n", __func__, (int) s, M, N, K);
@@ -587,8 +591,8 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
 }
 
 bool ggml_cuda_mul_mat_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                                ggml_tensor * dst, const ggml_tensor * x_scale) {
-    return lt_mul_mat(ctx, src0, src1, dst, x_scale, (const float *) src1->data, nullptr);
+                                ggml_tensor * dst, const ggml_tensor * x_scale, const ggml_tensor * res) {
+    return lt_mul_mat(ctx, src0, src1, dst, x_scale, (const float *) src1->data, nullptr, 0, res ? (const float *) res->data : nullptr);
 }
 
 void ggml_cuda_nvfp4_lt_note_node(const ggml_cgraph * cgraph, int node_idx) {
@@ -653,7 +657,9 @@ int ggml_cuda_rms_norm_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgra
     float *   d0  = (float *) lt_scratch_get(st.d0, (size_t) N * kblk * sizeof(float));
     float *   bmax = (float *) lt_scratch_get(st.bmax, (size_t) N * sizeof(float));
     if (!st.scal) {
-        CUDA_CHECK(cudaMalloc(&st.scal, 4 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&st.scal, 8 * sizeof(float)));
+        const float ones[8] = { 0, 0, 0, 0, 1.0f, 0, 0, 0 };
+        CUDA_CHECK(cudaMemcpy(st.scal, ones, sizeof(ones), cudaMemcpyHostToDevice));
     }
     float * scal = st.scal;
     float eps = 0.0f;
@@ -713,7 +719,23 @@ int ggml_cuda_mul_mat_nvfp4_lt_glu(ggml_backend_cuda_context & ctx, const ggml_c
             }
         }
     }
-    if (!lt_mul_mat(ctx, mm->src[0], glu, out, sc, (const float *) gate->data, (const float *) up->data, glu_op == GGML_GLU_OP_SWIGLU ? 2 : 1)) {
+    // the residual ADD right after: its output becomes the GEMM's, the add folded into beta * C
+    const ggml_tensor * res = nullptr;
+    if (node_idx + extra + 1 < cgraph->n_nodes) {
+        const ggml_tensor * add = cgraph->nodes[node_idx + extra + 1];
+        if (add->op == GGML_OP_ADD && add->type == GGML_TYPE_F32 && (add->src[0] == out || add->src[1] == out) &&
+            ggml_are_same_shape(add, out) && ggml_is_contiguous(add) && !(out->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_node_get_use_count(cgraph, node_idx + extra) == 1) {
+            const ggml_tensor * other = add->src[0] == out ? add->src[1] : add->src[0];
+            if (other != out && other->type == GGML_TYPE_F32 && ggml_is_contiguous(other) && ggml_are_same_shape(other, out)) {
+                res = other;
+                out = cgraph->nodes[node_idx + extra + 1];
+                extra += 1;
+            }
+        }
+    }
+    if (!lt_mul_mat(ctx, mm->src[0], glu, out, sc, (const float *) gate->data, (const float *) up->data, glu_op == GGML_GLU_OP_SWIGLU ? 2 : 1,
+                    res ? (const float *) res->data : nullptr)) {
         return 0;
     }
     return extra;
@@ -722,8 +744,8 @@ int ggml_cuda_mul_mat_nvfp4_lt_glu(ggml_backend_cuda_context & ctx, const ggml_c
 #else // GGML_CUDA_NVFP4_LT
 
 bool ggml_cuda_mul_mat_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
-                                ggml_tensor * dst, const ggml_tensor * x_scale) {
-    GGML_UNUSED_VARS(ctx, src0, src1, dst, x_scale);
+                                ggml_tensor * dst, const ggml_tensor * x_scale, const ggml_tensor * res) {
+    GGML_UNUSED_VARS(ctx, src0, src1, dst, x_scale, res);
     return false;   // no cuBLASLt here (HIP, MUSA, or a CUDA toolkit without FP4 types)
 }
 
