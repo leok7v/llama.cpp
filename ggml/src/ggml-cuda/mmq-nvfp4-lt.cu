@@ -106,18 +106,20 @@ static __device__ __forceinline__ float4 gated_norm_value(float4 v, float4 g, fl
 // GEGLU: X is the gate and G the up projection, the value quantized is gelu(x) * g (ggml's tanh gelu, bit-identical to the GLU op).
 // K must be a multiple of 128 (every gemma width is); the caller checks.
 // GLU 3, the gated per-head norm: the warp's 128 values are one head of X, G is the gate z, W the head-long norm weight.
+// The Kc values per row at row stride s_in land in columns [k_off, k_off + Kc) of the K_full-wide operand B and of d0s; the
+// whole quantize of a tensor is Kc == s_in == K_full with k_off == 0, a column chunk of the FFN is the rest.
 template <int GLU>   // 0: x; 1: gelu(x) * g (gemma's GEGLU); 2: silu(x) * g (Qwen's SWIGLU); 3: silu(g) * rmsnorm(x) * w
-static __global__ void k_quant_pass1(const float * __restrict__ X, const float * __restrict__ G, int N, int K, uint8_t * __restrict__ B,
-                                     float * __restrict__ d0s, float * __restrict__ bmax,
+static __global__ void k_quant_pass1(const float * __restrict__ X, const float * __restrict__ G, int N, int Kc, int s_in, int k_off, int K_full,
+                                     uint8_t * __restrict__ B, float * __restrict__ d0s, float * __restrict__ bmax,
                                      const float * __restrict__ W = nullptr, float eps = 0.0f) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int warps_per_block = blockDim.x >> 5;
-    const int chunks_per_row = K / 128;
+    const int chunks_per_row = Kc / 128;
     const int gwarp = blockIdx.x * warps_per_block + warp;
     const int n = gwarp / chunks_per_row, ch = gwarp % chunks_per_row;
     float d0 = 0.0f;
     if (n < N) {   // no early return: the warp shuffles below need every lane
-        const size_t off = (size_t) n * K + (size_t) ch * 128;
+        const size_t off = (size_t) n * s_in + (size_t) ch * 128;
         float4 v = reinterpret_cast<const float4 *>(X + off)[lane];
         if constexpr (GLU == 1) {
             const float4 g = reinterpret_cast<const float4 *>(G + off)[lane];
@@ -141,9 +143,10 @@ static __global__ void k_quant_pass1(const float * __restrict__ X, const float *
         const float inv = d0 > 0.0f ? 1.0f / d0 : 0.0f;
         const __nv_fp4x2_e2m1 q0(make_float2(v.x * inv, v.y * inv));
         const __nv_fp4x2_e2m1 q1(make_float2(v.z * inv, v.w * inv));
-        reinterpret_cast<uint16_t *>(B + (size_t) n * (K / 2) + (size_t) ch * 64)[lane] = (uint16_t) ((uint8_t) q0.__x | ((uint16_t) (uint8_t) q1.__x << 8));
+        const int kc = k_off + ch * 128;
+        reinterpret_cast<uint16_t *>(B + (size_t) n * (K_full / 2) + (size_t) kc / 2)[lane] = (uint16_t) ((uint8_t) q0.__x | ((uint16_t) (uint8_t) q1.__x << 8));
         if ((lane & 3) == 0) {
-            d0s[(size_t) n * (K / 16) + (size_t) ch * 8 + (lane >> 2)] = d0;
+            d0s[(size_t) n * (K_full / 16) + (size_t) kc / 16 + (lane >> 2)] = d0;
         }
     }
     // block max -> bmax[block]
@@ -379,10 +382,14 @@ struct lt_state {
     std::unordered_map<const void *, lt_repacked>    weights;
     std::unordered_map<uint64_t, lt_plan>            plans;
     lt_scratch                                       B, SFB, ws, d0, bmax;   // grown on demand; stream order makes reuse safe
+    lt_scratch                                       B2, SFB2, slabs, ws2;   // the FFN group's GLU operand, its two F32 chunk slabs, the side stream's workspace
+    cudaStream_t                                     side = nullptr;   // the FFN group's up GEMM runs here, forked from and joined to the graph's stream per chunk
+    cudaEvent_t                                      fork = nullptr;
+    cudaEvent_t                                      join = nullptr;
     float *                                          scal = nullptr;   // [0] alpha, [1] beta = 0, [2] max block scale bits
     bool                                             announced = false;
     bool                                             warned    = false;
-    const char *                                     said[16]  = {};   // the gated norm's reasons logged so far, once each
+    const char *                                     said[32]  = {};   // the hooks' reasons logged so far, once each
     int                                              n_said    = 0;
     // the graph node being computed (ggml_cuda_nvfp4_lt_note_node) and the operand the scratch currently holds: a later node of
     // the SAME graph evaluation whose src1 is the same tensor object reuses it (q, k, v read one normed input; gate and up another)
@@ -413,7 +420,8 @@ static lt_state & lt_state_for(int device) {
     return s[device];
 }
 
-// [0] alpha, [1] beta = 0, [2] the largest block scale's bits, [4] the beta of 1 for a folded residual, allocated once per device
+// [0] alpha, [1] beta = 0, [2] the largest block scale's bits, [4] the beta of 1 for a folded residual, [5] and [6] the gate's and
+// the up projection's alpha while an FFN group runs, allocated once per device
 static float * lt_scalars(lt_state & st) {
     if (!st.scal) {
         CUDA_CHECK(cudaMalloc(&st.scal, 8 * sizeof(float)));
@@ -469,10 +477,121 @@ static bool lt_make_plan(lt_state & st, lt_plan & P, int64_t M, int64_t N, int64
     return ok;
 }
 
-static cublasStatus_t lt_matmul(lt_state & st, lt_plan & P, int which, const float * scal, const uint8_t * A, const uint8_t * B, float * D,
+static bool lt_set_scales(lt_plan & P, const void * sfa, const void * sfb) {
+    return cublasLtMatmulDescSetAttribute(P.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sfa, sizeof(sfa)) == CUBLAS_STATUS_SUCCESS &&
+           cublasLtMatmulDescSetAttribute(P.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sfb, sizeof(sfb)) == CUBLAS_STATUS_SUCCESS;
+}
+
+// alpha is a device float; beta is the device 0 or, with a residual res, the device 1 of lt_scalars, so cuBLASLt adds res as C
+static cublasStatus_t lt_matmul(lt_state & st, lt_plan & P, int which, const float * alpha, const uint8_t * A, const uint8_t * B, float * D,
                          char * ws, size_t ws_size, cudaStream_t stream, const float * res = nullptr) {
-    // res: a same-shape residual folded in as beta * C with beta = 1 (scal[4], written once), the separate ADD kernel gone
-    return cublasLtMatmul(st.handle, P.op, scal, A, P.Al, B, P.Bl, res ? scal + 4 : scal + 1, res ? res : D, P.Dl, D, P.Dl, &P.heur[which].algo, ws, ws_size, stream);
+    return cublasLtMatmul(st.handle, P.op, alpha, A, P.Al, B, P.Bl, res ? st.scal + 4 : st.scal + 1, res ? res : D, P.Dl, D, P.Dl, &P.heur[which].algo, ws, ws_size, stream);
+}
+
+static int32_t lt_splitk(const lt_plan & P, int a) {
+    int32_t splitk = 0;
+    size_t  sz     = 0;
+    cublasLtMatmulAlgoConfigGetAttribute(&P.heur[a].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk, sizeof(splitk), &sz);
+    return splitk;
+}
+
+// the first call for a shape times every heuristic candidate on the real operands and keeps the fastest (the operands are consumed
+// identically by each, so D holds the right result whichever ran last); a choice the tune file remembers wins, and under graph
+// capture nothing is timed, so the plan stays untuned for a later eager call. With plain_k only candidates with one K loop count:
+// a split or stream-K candidate sums in an order that depends on M, and a chunk's rows must equal the whole GEMM's bit for bit.
+static void lt_tune_plan(lt_state & st, lt_plan & P, int64_t M, int64_t N, int64_t K, int cc, const float * alpha, const uint8_t * A,
+                         const uint8_t * B, float * D, char * ws, cudaStream_t stream, bool plain_k = false) {
+    if (!P.tuned) {
+        const int remembered = lt_tune_lookup(M, N, K, cc);
+        if (remembered >= 0 && remembered < P.n_heur && (!plain_k || lt_splitk(P, remembered) == 1)) {
+            P.best  = remembered;
+            P.tuned = true;
+        }
+    }
+    if (!P.tuned) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
+        if (cap == cudaStreamCaptureStatusNone) {
+            cudaEvent_t e0, e1;
+            CUDA_CHECK(cudaEventCreate(&e0));
+            CUDA_CHECK(cudaEventCreate(&e1));
+            float best_ms = 1e30f;
+            for (int a = 0; a < P.n_heur; ++a) {
+                const bool wanted = !plain_k || lt_splitk(P, a) == 1;
+                const bool runs   = wanted && lt_matmul(st, P, a, alpha, A, B, D, ws, LT_WORKSPACE, stream) == CUBLAS_STATUS_SUCCESS;
+                if (runs) {
+                    CUDA_CHECK(cudaEventRecord(e0, stream));
+                    for (int i = 0; i < 4; ++i) {
+                        lt_matmul(st, P, a, alpha, A, B, D, ws, LT_WORKSPACE, stream);
+                    }
+                    CUDA_CHECK(cudaEventRecord(e1, stream));
+                    CUDA_CHECK(cudaEventSynchronize(e1));
+                    float ms = 0.0f;
+                    CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+                    if (ms < best_ms) {
+                        best_ms = ms;
+                        P.best = a;
+                    }
+                }
+            }
+            CUDA_CHECK(cudaEventDestroy(e0));
+            CUDA_CHECK(cudaEventDestroy(e1));
+            P.tuned = true;
+            lt_tune_store(M, N, K, cc, P.best);
+        }
+    }
+}
+
+// the weight's operand, repacked on its first use and kept; nullptr when the address is cached with another shape
+static lt_repacked * lt_repack(lt_state & st, const ggml_tensor * src0, cudaStream_t stream) {
+    const int64_t M = src0->ne[1], K = src0->ne[0], kblk = K / 16, kblk_pad = pad4(kblk);
+    lt_repacked & w = st.weights[src0->data];
+    if (!w.A) {
+        const size_t sf_size = (size_t) pad128(M) * kblk_pad;
+        CUDA_CHECK(cudaMalloc(&w.A, (size_t) M * K / 2));
+        CUDA_CHECK(cudaMalloc(&w.SF, sf_size));
+        CUDA_CHECK(cudaMemsetAsync(w.SF, 0, sf_size, stream));
+        const int64_t n = M * kblk;
+        k_repack<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>((const block_nvfp4 *) src0->data, (int) M, (int) K, w.A, w.SF, (int) kblk_pad);
+        CUDA_CHECK(cudaGetLastError());
+        w.M = M;
+        w.K = K;
+    }
+    return w.M == M && w.K == K ? &w : nullptr;
+}
+
+// the side stream and its two events, made once per device; the events carry no timing, so a capture of the graph's stream takes them
+static cudaStream_t lt_side_stream(lt_state & st) {
+    if (st.side == nullptr) {
+        CUDA_CHECK(cudaStreamCreateWithFlags(&st.side, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&st.fork, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&st.join, cudaEventDisableTiming));
+    }
+    return st.side;
+}
+
+// act0 (and act1 for a GLU) quantized into B and SFB in the tile layout: the block scales' maximum into scal[2], alpha = g * (w_gs
+// or 1) into scal[0]; glu as k_quant_pass1's GLU, 0 for a plain activation
+static void lt_quantize(lt_state & st, const float * act0, const float * act1, int glu, int64_t N, int64_t K, const float * w_gs,
+                        uint8_t * B, uint8_t * SFB, cudaStream_t stream) {
+    const int64_t  kblk = K / 16, kblk_pad = pad4(kblk);
+    const unsigned nblocks = (unsigned) ((N * (K / 128) + 7) / 8);   // a warp per 128 values, 8 warps per block
+    float * d0   = (float *) lt_scratch_get(st.d0, (size_t) N * kblk * sizeof(float));
+    float * bmax = (float *) lt_scratch_get(st.bmax, (size_t) nblocks * sizeof(float));
+    float * scal = lt_scalars(st);
+    CUDA_CHECK(cudaMemsetAsync(SFB, 0, (size_t) pad128(N) * kblk_pad, stream));
+    CUDA_CHECK(cudaMemsetAsync(scal, 0, 4 * sizeof(float), stream));
+    if (act1 && glu == 2) {
+        k_quant_pass1<2><<<nblocks, 256, 0, stream>>>(act0, act1, (int) N, (int) K, (int) K, 0, (int) K, B, d0, bmax);
+    } else if (act1) {
+        k_quant_pass1<1><<<nblocks, 256, 0, stream>>>(act0, act1, (int) N, (int) K, (int) K, 0, (int) K, B, d0, bmax);
+    } else {
+        k_quant_pass1<0><<<nblocks, 256, 0, stream>>>(act0, nullptr, (int) N, (int) K, (int) K, 0, (int) K, B, d0, bmax);
+    }
+    k_quant_fold<<<1, 1024, 0, stream>>>(bmax, (int) nblocks, reinterpret_cast<unsigned *>(scal) + 2);
+    k_quant_pass2<<<(unsigned) ((N * kblk + 255) / 256), 256, 0, stream>>>(d0, (int) N, (int) K, reinterpret_cast<const unsigned *>(scal) + 2,
+        w_gs, SFB, (int) kblk_pad, scal);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace
@@ -505,7 +624,7 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
         return false;
     }
     const int64_t M = ne01, K = ne00, N = ne11;
-    const int64_t kblk = K / 16, kblk_pad = pad4(kblk);
+    const int64_t kblk_pad = pad4(K / 16);
 
     lt_state & st = lt_state_for(id);
     if (!st.handle && cublasLtCreate(&st.handle) != CUBLAS_STATUS_SUCCESS) {
@@ -517,52 +636,25 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
     }
     cudaStream_t stream = ctx.stream();
 
-    // the weight, repacked once
-    lt_repacked & w = st.weights[src0->data];
-    if (!w.A) {
-        const size_t sf_size = (size_t) pad128(M) * kblk_pad;
-        CUDA_CHECK(cudaMalloc(&w.A, (size_t) M * K / 2));
-        CUDA_CHECK(cudaMalloc(&w.SF, sf_size));
-        CUDA_CHECK(cudaMemsetAsync(w.SF, 0, sf_size, stream));
-        const int64_t n = M * kblk;
-        k_repack<<<(unsigned) ((n + 255) / 256), 256, 0, stream>>>((const block_nvfp4 *) src0->data, (int) M, (int) K, w.A, w.SF, (int) kblk_pad);
-        CUDA_CHECK(cudaGetLastError());
-        w.M = M;
-        w.K = K;
-    } else if (w.M != M || w.K != K) {
+    const lt_repacked * w = lt_repack(st, src0, stream);
+    if (w == nullptr) {
         return false;   // the same address with another shape is not the weight this cache knows
     }
 
     // the activations, quantized for this call
-    const size_t sfb_size = (size_t) pad128(N) * kblk_pad;
     const float * w_gs = x_scale ? (const float *) x_scale->data : nullptr;
     // the same src1 tensor object, quantized for an earlier node of this very graph evaluation: the FP4 operand is still in the
     // scratch (only this path writes it), so only alpha changes. Never across evaluations (the node index restarts from zero).
     const bool reuse = !act1 && st.cur_graph && st.q_graph == st.cur_graph && st.q_node >= 0 && st.q_node < st.cur_node &&
                        st.q_src1 == src1 && st.q_N == N && st.q_K == K && st.B.ptr && st.SFB.ptr && st.scal;
     uint8_t * B   = (uint8_t *) lt_scratch_get(st.B, (size_t) N * K / 2);
-    uint8_t * SFB = (uint8_t *) lt_scratch_get(st.SFB, sfb_size);
+    uint8_t * SFB = (uint8_t *) lt_scratch_get(st.SFB, (size_t) pad128(N) * kblk_pad);
     char *    ws  = (char *) lt_scratch_get(st.ws, LT_WORKSPACE);
     float *   scal = lt_scalars(st);
     if (reuse) {
         k_alpha<<<1, 1, 0, stream>>>(reinterpret_cast<const unsigned *>(scal) + 2, w_gs, scal);
     } else {
-        float *   d0  = (float *) lt_scratch_get(st.d0, (size_t) N * kblk * sizeof(float));
-        CUDA_CHECK(cudaMemsetAsync(SFB, 0, sfb_size, stream));
-        CUDA_CHECK(cudaMemsetAsync(scal, 0, 4 * sizeof(float), stream));
-        const int64_t nq = N * kblk;
-        const unsigned nblocks = (unsigned) ((N * (K / 128) + 7) / 8);   // a warp per 128 values, 8 warps per block
-        float * bmax = (float *) lt_scratch_get(st.bmax, (size_t) nblocks * sizeof(float));
-        if (act1 && glu == 2) {
-            k_quant_pass1<2><<<nblocks, 256, 0, stream>>>(act0, act1, (int) N, (int) K, B, d0, bmax);
-        } else if (act1) {
-            k_quant_pass1<1><<<nblocks, 256, 0, stream>>>(act0, act1, (int) N, (int) K, B, d0, bmax);
-        } else {
-            k_quant_pass1<0><<<nblocks, 256, 0, stream>>>(act0, nullptr, (int) N, (int) K, B, d0, bmax);
-        }
-        k_quant_fold<<<1, 1024, 0, stream>>>(bmax, (int) nblocks, reinterpret_cast<unsigned *>(scal) + 2);
-        k_quant_pass2<<<(unsigned) ((nq + 255) / 256), 256, 0, stream>>>(d0, (int) N, (int) K, reinterpret_cast<const unsigned *>(scal) + 2,
-            w_gs, SFB, (int) kblk_pad, scal);
+        lt_quantize(st, act0, act1, glu, N, K, w_gs, B, SFB, stream);
         // remember what the scratch holds (a GEGLU operand is unique to its matmul: not reusable)
         st.q_graph = act1 ? nullptr : st.cur_graph;
         st.q_node  = act1 ? -1 : st.cur_node;
@@ -572,7 +664,7 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
     }
     CUDA_CHECK(cudaGetLastError());
 
-    const void * sfa = w.SF;
+    const void * sfa = w->SF;
     const void * sfb = SFB;
     if (!P.pref && !lt_make_plan(st, P, M, N, K, sfa, sfb)) {
         if (!st.warned) {
@@ -585,53 +677,12 @@ static bool lt_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0
         GGML_LOG_INFO("%s: NVFP4 matmuls with %" PRId64 "+ tokens run on cuBLASLt's block-scaled FP4 tensor-core path (cc %d)\n", __func__, LT_MIN_TOKENS, cc);
         st.announced = true;
     }
-    if (cublasLtMatmulDescSetAttribute(P.op, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER, &sfa, sizeof(sfa)) != CUBLAS_STATUS_SUCCESS ||
-        cublasLtMatmulDescSetAttribute(P.op, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER, &sfb, sizeof(sfb)) != CUBLAS_STATUS_SUCCESS) {
+    if (!lt_set_scales(P, sfa, sfb)) {
         return false;
     }
     float * D = (float *) dst->data;
-
-    // first call for this shape: time every heuristic candidate on the real operands and keep the fastest (the operands
-    // are consumed identically by each, so D holds the right result whichever ran last). Skipped under graph capture.
-    if (!P.tuned) {
-        const int remembered = lt_tune_lookup(M, N, K, cc);
-        if (remembered >= 0 && remembered < P.n_heur) {
-            P.best  = remembered;
-            P.tuned = true;
-        }
-    }
-    if (!P.tuned) {
-        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
-        CUDA_CHECK(cudaStreamIsCapturing(stream, &cap));
-        if (cap == cudaStreamCaptureStatusNone) {
-            cudaEvent_t e0, e1;
-            CUDA_CHECK(cudaEventCreate(&e0));
-            CUDA_CHECK(cudaEventCreate(&e1));
-            float best_ms = 1e30f;
-            for (int a = 0; a < P.n_heur; ++a) {
-                if (lt_matmul(st, P, a, scal, w.A, B, D, ws, LT_WORKSPACE, stream) != CUBLAS_STATUS_SUCCESS) {
-                    continue;
-                }
-                CUDA_CHECK(cudaEventRecord(e0, stream));
-                for (int i = 0; i < 4; ++i) {
-                    lt_matmul(st, P, a, scal, w.A, B, D, ws, LT_WORKSPACE, stream);
-                }
-                CUDA_CHECK(cudaEventRecord(e1, stream));
-                CUDA_CHECK(cudaEventSynchronize(e1));
-                float ms = 0.0f;
-                CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
-                if (ms < best_ms) {
-                    best_ms = ms;
-                    P.best = a;
-                }
-            }
-            CUDA_CHECK(cudaEventDestroy(e0));
-            CUDA_CHECK(cudaEventDestroy(e1));
-            P.tuned = true;
-            lt_tune_store(M, N, K, cc, P.best);
-        }
-    }
-    const cublasStatus_t s = lt_matmul(st, P, P.best, scal, w.A, B, D, ws, LT_WORKSPACE, stream, res);
+    lt_tune_plan(st, P, M, N, K, cc, scal, w->A, B, D, ws, stream);
+    const cublasStatus_t s = lt_matmul(st, P, P.best, scal, w->A, B, D, ws, LT_WORKSPACE, stream, res);
     if (s != CUBLAS_STATUS_SUCCESS) {
         if (!st.warned) {
             GGML_LOG_WARN("%s: cublasLtMatmul failed (%d) for M=%" PRId64 " N=%" PRId64 " K=%" PRId64 ", MMQ runs it\n", __func__, (int) s, M, N, K);
@@ -972,7 +1023,7 @@ static void gated_norm_quantize(ggml_backend_cuda_context & ctx, lt_state & st, 
     float *   scal = lt_scalars(st);
     CUDA_CHECK(cudaMemsetAsync(SFB, 0, sfb_size, stream));
     CUDA_CHECK(cudaMemsetAsync(scal, 0, 4 * sizeof(float), stream));
-    k_quant_pass1<3><<<nblocks, 256, 0, stream>>>((const float *) m.x->data, (const float *) m.z->data, (int) N, (int) K, B, d0, bmax,
+    k_quant_pass1<3><<<nblocks, 256, 0, stream>>>((const float *) m.x->data, (const float *) m.z->data, (int) N, (int) K, (int) K, 0, (int) K, B, d0, bmax,
                                                   (const float *) m.w->data, m.eps);
     k_quant_fold<<<1, 1024, 0, stream>>>(bmax, (int) nblocks, reinterpret_cast<unsigned *>(scal) + 2);
     k_quant_pass2<<<(unsigned) ((N * kblk + 255) / 256), 256, 0, stream>>>(d0, (int) N, (int) K, reinterpret_cast<const unsigned *>(scal) + 2,
@@ -1060,6 +1111,316 @@ int ggml_cuda_mul_mat_nvfp4_lt_glu(ggml_backend_cuda_context & ctx, const ggml_c
     return extra;
 }
 
+// The dense FFN of a layer, matched at its first matmul: MUL_MAT(x) of the gate or the up weight, [MUL by its one-element scale],
+// MUL_MAT(x) of the other, [MUL scale], GLU(gate, up) (SWIGLU or GEGLU, split form), MUL_MAT(down) of the GLU, [MUL scale], [ADD of
+// a same-shape residual], in consecutive nodes, every weight NVFP4. The gate and up GEMMs run per column chunk of the FFN width
+// into two slabs that stay in L2, the up GEMM on a side stream forked from and joined to the graph's stream, and the GLU quantize
+// of each chunk reads the slabs there, so the F32 pre-activations never reach DRAM. A chunk's blocks, their d0 and their E2M1
+// values are the whole quantize's, and the tensor scale comes from one fold over every chunk, so the operand the down GEMM reads is
+// byte for byte that of a whole GEMM with one K loop. On a refusal why names the first condition the graph fails.
+constexpr size_t  LT_FFN_SLAB_BYTES = 9u << 20;   // the two F32 chunk slabs together: under a 12 MB L2 with the GEMM operands
+constexpr int64_t LT_FFN_MIN_TILES  = 8;          // a chunk of fewer 128-row tiles leaves the 20 SMs under-filled
+
+struct ffn_match {
+    int                 n_nodes = 0;         // the group's nodes, 4 to 8, 0 on a refusal
+    int                 i_first = -1;        // the first matmul's node index
+    int                 i_down  = -1;        // the down matmul's node index
+    const ggml_tensor * x       = nullptr;   // the input both projections read
+    const ggml_tensor * gate_w  = nullptr;
+    const ggml_tensor * up_w    = nullptr;
+    const ggml_tensor * gate_s  = nullptr;   // the one-element scales, nullptr where the graph has none
+    const ggml_tensor * up_s    = nullptr;
+    const ggml_tensor * down_w  = nullptr;
+    const ggml_tensor * down_s  = nullptr;
+    const ggml_tensor * glu     = nullptr;
+    const ggml_tensor * res     = nullptr;   // the residual of the ADD, nullptr without one
+    ggml_tensor *       out     = nullptr;   // the group's last node, the down GEMM's output
+    int                 glu_op  = 0;         // k_quant_pass1's GLU: 1 gelu, 2 silu
+    const char *        why     = nullptr;   // a literal, so a refusal is logged once per distinct reason
+    const ggml_tensor * at      = nullptr;
+};
+
+// one projection: a MUL_MAT of x by an NVFP4 weight with one reader, and its one-element scale MUL when the graph has one
+struct ffn_proj {
+    const ggml_tensor * w    = nullptr;
+    const ggml_tensor * s    = nullptr;
+    const ggml_tensor * out  = nullptr;   // the matmul, or its scale MUL
+    int                 next = -1;        // the node after the projection
+};
+
+static bool nvfp4_weight(const ggml_tensor * w) {
+    return w != nullptr && w->type == GGML_TYPE_NVFP4 && w->ne[2] == 1 && w->ne[3] == 1 && ggml_is_contiguous(w) &&
+           ggml_backend_buffer_get_usage(w->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+static bool one_element_f32(const ggml_tensor * s) {
+    return s != nullptr && s->type == GGML_TYPE_F32 && ggml_nelements(s) == 1;
+}
+
+// node j: a projection of x, with w == nullptr when node j is not one
+static ffn_proj ffn_proj_at(const ggml_cgraph * g, int j, const ggml_tensor * x) {
+    const ggml_tensor * mm  = node_at(g, j);
+    const ggml_tensor * nxt = node_at(g, j + 1);
+    const ggml_tensor * s   = nxt != nullptr && nxt->op == GGML_OP_MUL ? other_src(nxt, mm) : nullptr;
+    const bool matmul = mm != nullptr && mm->op == GGML_OP_MUL_MAT && mm->src[1] == x && nvfp4_weight(mm->src[0]) && fusable_f32(g, j);
+    const bool scaled = matmul && one_element_f32(s) && nxt->type == GGML_TYPE_F32 && ggml_are_same_shape(nxt, mm) && fusable_f32(g, j + 1);
+    ffn_proj p;
+    p.w    = matmul ? mm->src[0] : nullptr;
+    p.s    = scaled ? s : nullptr;
+    p.out  = scaled ? nxt : (matmul ? mm : nullptr);
+    p.next = scaled ? j + 2 : (matmul ? j + 1 : -1);
+    return p;
+}
+
+// nodes i and on: the two projections of one input
+static const char * ffn_projections(const ggml_cgraph * g, int i, ffn_match & m, ffn_proj & p1, ffn_proj & p2) {
+    const ggml_tensor * mm  = node_at(g, i);
+    const ggml_tensor * x   = mm != nullptr && mm->op == GGML_OP_MUL_MAT ? mm->src[1] : nullptr;
+    const char *        why = nullptr;
+    p1 = ffn_proj_at(g, i, x);
+    p2 = p1.next > 0 ? ffn_proj_at(g, p1.next, x) : ffn_proj();
+    if (p1.w == nullptr) {
+        why = "the node is not an NVFP4 matmul with one reader";
+    } else if (x->type != GGML_TYPE_F32 || x->ne[2] != 1 || x->ne[3] != 1 || !aligned16(x)) {
+        why = "the input is not a contiguous F32 token batch";
+    } else if (x->ne[1] < LT_MIN_TOKENS) {
+        why = "fewer than 16 tokens";
+    } else if (x->ne[0] % 128 != 0) {
+        why = "the input width is not a multiple of 128";
+    } else if (p2.w == nullptr) {
+        why = "the node after the first projection is not a second NVFP4 matmul of the same input";
+    } else if (p1.w->ne[1] != p2.w->ne[1] || p1.w->ne[1] % 128 != 0) {
+        why = "the two projections differ in width, or the width is not a multiple of 128";
+    }
+    m.x  = why ? nullptr : x;
+    m.at = why ? mm : nullptr;
+    return why;
+}
+
+// node p2.next: the GLU that joins the two projections, the gate as its first source
+static const char * ffn_glu(const ggml_cgraph * g, const ffn_proj & p1, const ffn_proj & p2, ffn_match & m) {
+    const int           j      = p2.next;
+    const ggml_tensor * glu    = node_at(g, j);
+    const bool          is_glu = glu != nullptr && glu->op == GGML_OP_GLU && glu->src[1] != nullptr;
+    const ggml_glu_op   op     = is_glu ? ggml_get_glu_op(glu) : GGML_GLU_OP_COUNT;
+    const bool          p1_gate = is_glu && glu->src[0] == p1.out && glu->src[1] == p2.out;
+    const bool          p2_gate = is_glu && glu->src[0] == p2.out && glu->src[1] == p1.out;
+    const ffn_proj &    gate   = p2_gate ? p2 : p1;
+    const ffn_proj &    up     = p2_gate ? p1 : p2;
+    const char *        why    = nullptr;
+    if (!is_glu || (op != GGML_GLU_OP_SWIGLU && op != GGML_GLU_OP_GEGLU) || ((const int32_t *) glu->op_params)[1] != 0) {
+        why = "the node after the projections is not a split SWIGLU or GEGLU";
+    } else if (!p1_gate && !p2_gate) {
+        why = "the GLU does not join the two projections";
+    } else if (!fusable_f32(g, j) || !ggml_are_same_shape(glu, p1.out) || !ggml_are_same_shape(glu, p2.out)) {
+        why = "the GLU has another reader or another shape";
+    }
+    m.glu    = why ? nullptr : glu;
+    m.glu_op = op == GGML_GLU_OP_GEGLU ? 1 : 2;
+    m.gate_w = why ? nullptr : gate.w;
+    m.gate_s = why ? nullptr : gate.s;
+    m.up_w   = why ? nullptr : up.w;
+    m.up_s   = why ? nullptr : up.s;
+    m.i_down = why ? -1 : j + 1;
+    m.at     = why ? (glu ? glu : p2.out) : nullptr;
+    return why;
+}
+
+// node m.i_down: the down matmul of the GLU, its optional scale MUL and the optional residual ADD; the last of them is the output
+static const char * ffn_down(const ggml_cgraph * g, ffn_match & m) {
+    const int           j      = m.i_down;
+    const ggml_tensor * mm     = node_at(g, j);
+    const ggml_tensor * n1     = node_at(g, j + 1);
+    const ggml_tensor * s      = n1 != nullptr && n1->op == GGML_OP_MUL ? other_src(n1, mm) : nullptr;
+    const bool          matmul = mm != nullptr && mm->op == GGML_OP_MUL_MAT && mm->src[1] == m.glu && nvfp4_weight(mm->src[0]) && mm->type == GGML_TYPE_F32;
+    const bool          scaled = matmul && one_element_f32(s) && n1->type == GGML_TYPE_F32 && ggml_are_same_shape(n1, mm) && fusable_f32(g, j);
+    const int           j1     = scaled ? j + 1 : j;
+    const ggml_tensor * o1     = scaled ? n1 : mm;
+    const ggml_tensor * n2     = matmul ? node_at(g, j1 + 1) : nullptr;
+    const ggml_tensor * r      = n2 != nullptr && n2->op == GGML_OP_ADD ? other_src(n2, o1) : nullptr;
+    const bool          added  = matmul && r != nullptr && r != o1 && r->type == GGML_TYPE_F32 && n2->type == GGML_TYPE_F32 && ggml_are_same_shape(n2, o1) &&
+                                 ggml_are_same_shape(r, o1) && aligned16(r) && fusable_f32(g, j1);
+    const int           j_out  = added ? j1 + 1 : j1;
+    ggml_tensor *       out    = matmul ? g->nodes[j_out] : nullptr;
+    const char *        why    = nullptr;
+    if (!matmul) {
+        why = "the node after the GLU is not an NVFP4 matmul of it";
+    } else if (mm->src[0]->ne[0] != m.glu->ne[0]) {
+        why = "the down weight's width is not the GLU's";
+    } else if (out->type != GGML_TYPE_F32 || !aligned16(out)) {
+        why = "the output is not contiguous F32";
+    }
+    m.down_w  = why ? nullptr : mm->src[0];
+    m.down_s  = why || !scaled ? nullptr : s;
+    m.res     = why || !added ? nullptr : r;
+    m.out     = why ? nullptr : out;
+    m.n_nodes = why ? 0 : j_out - m.i_first + 1;
+    m.at      = why ? (mm ? mm : m.glu) : nullptr;
+    return why;
+}
+
+static ffn_match ffn_match_at(const ggml_cgraph * g, int i) {
+    ffn_match m;
+    ffn_proj  p1, p2;
+    m.i_first = i;
+    const char * w1 = ffn_projections(g, i, m, p1, p2);
+    const char * w2 = w1 ? w1 : ffn_glu(g, p1, p2, m);
+    m.why = w2 ? w2 : ffn_down(g, m);
+    return m;
+}
+
+// the chunk of the FFN width M for N tokens: the most 128-row tiles that divide M whose two F32 slabs fit LT_FFN_SLAB_BYTES;
+// 0 when no chunk of LT_FFN_MIN_TILES or more fits, M when the whole width fits
+static int64_t ffn_chunk_rows(int64_t M, int64_t N) {
+    const int64_t tiles = M / 128;
+    const int64_t fit   = (int64_t) (LT_FFN_SLAB_BYTES / (2 * 128 * (size_t) N * sizeof(float)));
+    int64_t       best  = 0;
+    for (int64_t t = 1; t <= tiles && t <= fit; ++t) {
+        if (tiles % t == 0) {
+            best = t;
+        }
+    }
+    return best >= LT_FFN_MIN_TILES ? best * 128 : 0;
+}
+
+// what the group needs from the device: the weights' repacks, the chunk and down plans
+struct ffn_plans {
+    int64_t       Mc = 0;
+    lt_repacked * wg = nullptr;
+    lt_repacked * wu = nullptr;
+    lt_repacked * wd = nullptr;
+    lt_plan *     Pc = nullptr;
+    lt_plan *     Pd = nullptr;
+};
+
+// a plan made on first sight; the heuristic wants scale pointers, and the per-call ones are set before each GEMM
+static bool ffn_plan_ok(lt_state & st, lt_plan & P, int64_t M, int64_t N, int64_t K, const void * sfa, const void * sfb) {
+    return P.pref ? P.ok : lt_make_plan(st, P, M, N, K, sfa, sfb);
+}
+
+static const char * ffn_route_refusal(ggml_backend_cuda_context & ctx, lt_state & st, const ffn_match & m, int cc, ffn_plans & pl) {
+    const int64_t N = m.x->ne[1], K = m.x->ne[0], M = m.gate_w->ne[1], Kd = m.down_w->ne[1];
+    cudaStream_t  stream = ctx.stream();
+    const char *  why    = nullptr;
+    pl.Mc = ffn_chunk_rows(M, N);
+    if (!blackwell_mma_available(cc)) {
+        why = "no Blackwell tensor cores";
+    } else if (!st.handle && cublasLtCreate(&st.handle) != CUBLAS_STATUS_SUCCESS) {
+        why = "cuBLASLt gives no handle";
+    } else if (pl.Mc == 0) {
+        why = "no chunk of the width fits the slab budget";
+    } else if (pl.Mc == M) {
+        why = "the width fits one chunk, the plain order moves the same bytes";
+    } else if (m.res != nullptr && m.res->data == m.out->data) {
+        why = "the output aliases the residual";
+    } else {
+        pl.wg = lt_repack(st, m.gate_w, stream);
+        pl.wu = lt_repack(st, m.up_w, stream);
+        pl.wd = lt_repack(st, m.down_w, stream);
+        pl.Pc = &st.plans[lt_plan_key(pl.Mc, N, K)];
+        pl.Pd = &st.plans[lt_plan_key(Kd, N, M)];
+        const bool weights  = pl.wg != nullptr && pl.wu != nullptr && pl.wd != nullptr;
+        const bool chunk_ok = weights && ffn_plan_ok(st, *pl.Pc, pl.Mc, N, K, pl.wg->SF, lt_scalars(st));
+        const bool down_ok  = weights && ffn_plan_ok(st, *pl.Pd, Kd, N, M, pl.wd->SF, lt_scalars(st));
+        why = !weights ? "a weight's address is cached with another shape" :
+              !chunk_ok ? "cuBLASLt refused the chunk shape" :
+              !down_ok  ? "cuBLASLt refused the down shape" : nullptr;
+    }
+    return why;
+}
+
+// the group computed: the input operand (parked by the pre-norm hook, else quantized here), the two alphas, the chunk loop with the
+// up GEMM on the side stream, one fold and one scale pass over every chunk, the down GEMM with its residual. False when a GEMM
+// refused, and then nothing of the graph's tensors is written, so the plain path computes the group. The side stream joins the
+// graph's stream before the quantize of every chunk, so a capture of the graph's stream holds both.
+static bool ffn_run(ggml_backend_cuda_context & ctx, lt_state & st, const ggml_cgraph * g, int i, const ffn_match & m, const ffn_plans & pl, int cc) {
+    const int64_t  N = m.x->ne[1], K = m.x->ne[0], M = m.gate_w->ne[1], Kd = m.down_w->ne[1], Mc = pl.Mc, C = M / Mc;
+    const int64_t  kblk = M / 16, kblk_pad = pad4(kblk), kblk_pad_x = pad4(K / 16);
+    const size_t   sfb2_size = (size_t) pad128(N) * kblk_pad;
+    const unsigned nblk_c    = (unsigned) ((N * (Mc / 128) + 7) / 8);
+    cudaStream_t   stream    = ctx.stream();
+    cudaStream_t   side      = lt_side_stream(st);
+    float *        scal      = lt_scalars(st);
+    char *         ws        = (char *) lt_scratch_get(st.ws, LT_WORKSPACE);
+    char *         ws2       = (char *) lt_scratch_get(st.ws2, LT_WORKSPACE);
+    const bool parked = st.q_graph == g && st.q_src1 == m.x && st.q_node >= 0 && st.q_node < i && st.q_N == N && st.q_K == K && st.B.ptr && st.SFB.ptr;
+    uint8_t * Bx   = (uint8_t *) (parked ? st.B.ptr   : lt_scratch_get(st.B, (size_t) N * K / 2));
+    uint8_t * SFBx = (uint8_t *) (parked ? st.SFB.ptr : lt_scratch_get(st.SFB, (size_t) pad128(N) * kblk_pad_x));
+    if (!parked) {
+        lt_quantize(st, (const float *) m.x->data, nullptr, 0, N, K, nullptr, Bx, SFBx, stream);
+        st.q_graph = g;
+        st.q_node  = i;
+        st.q_src1  = m.x;
+        st.q_N = N;
+        st.q_K = K;
+    }
+    k_alpha<<<1, 1, 0, stream>>>(reinterpret_cast<const unsigned *>(scal) + 2, m.gate_s ? (const float *) m.gate_s->data : nullptr, scal + 5);
+    k_alpha<<<1, 1, 0, stream>>>(reinterpret_cast<const unsigned *>(scal) + 2, m.up_s ? (const float *) m.up_s->data : nullptr, scal + 6);
+    float *   G    = (float *) lt_scratch_get(st.slabs, 2 * (size_t) Mc * N * sizeof(float));
+    float *   U    = G + Mc * N;
+    uint8_t * B2   = (uint8_t *) lt_scratch_get(st.B2, (size_t) N * M / 2);
+    uint8_t * SFB2 = (uint8_t *) lt_scratch_get(st.SFB2, sfb2_size);
+    float *   d0   = (float *) lt_scratch_get(st.d0, (size_t) N * kblk * sizeof(float));
+    float *   bmax = (float *) lt_scratch_get(st.bmax, (size_t) C * nblk_c * sizeof(float));
+    CUDA_CHECK(cudaMemsetAsync(SFB2, 0, sfb2_size, stream));
+    lt_plan & Pc = *pl.Pc;
+    lt_plan & Pd = *pl.Pd;
+    cublasStatus_t s = lt_set_scales(Pc, pl.wg->SF, SFBx) ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
+    if (s == CUBLAS_STATUS_SUCCESS) {
+        lt_tune_plan(st, Pc, Mc, N, K, cc, scal + 5, pl.wg->A, Bx, G, ws, stream, true);
+    }
+    for (int64_t c = 0; c < C && s == CUBLAS_STATUS_SUCCESS; ++c) {
+        const size_t a_off  = (size_t) c * Mc * K / 2;
+        const size_t sf_off = (size_t) (c * Mc / 128) * (kblk_pad_x / 4) * 512;
+        CUDA_CHECK(cudaEventRecord(st.fork, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(side, st.fork, 0));
+        s = lt_set_scales(Pc, pl.wg->SF + sf_off, SFBx) ? lt_matmul(st, Pc, Pc.best, scal + 5, pl.wg->A + a_off, Bx, G, ws, LT_WORKSPACE, stream) : CUBLAS_STATUS_INVALID_VALUE;
+        if (s == CUBLAS_STATUS_SUCCESS) {
+            s = lt_set_scales(Pc, pl.wu->SF + sf_off, SFBx) ? lt_matmul(st, Pc, Pc.best, scal + 6, pl.wu->A + a_off, Bx, U, ws2, LT_WORKSPACE, side) : CUBLAS_STATUS_INVALID_VALUE;
+        }
+        CUDA_CHECK(cudaEventRecord(st.join, side));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, st.join, 0));
+        if (s == CUBLAS_STATUS_SUCCESS && m.glu_op == 1) {
+            k_quant_pass1<1><<<nblk_c, 256, 0, stream>>>(G, U, (int) N, (int) Mc, (int) Mc, (int) (c * Mc), (int) M, B2, d0, bmax + c * nblk_c);
+        } else if (s == CUBLAS_STATUS_SUCCESS) {
+            k_quant_pass1<2><<<nblk_c, 256, 0, stream>>>(G, U, (int) N, (int) Mc, (int) Mc, (int) (c * Mc), (int) M, B2, d0, bmax + c * nblk_c);
+        }
+    }
+    if (s == CUBLAS_STATUS_SUCCESS) {
+        float * D = (float *) m.out->data;
+        k_quant_fold<<<1, 1024, 0, stream>>>(bmax, (int) (C * nblk_c), reinterpret_cast<unsigned *>(scal) + 2);
+        k_quant_pass2<<<(unsigned) ((N * kblk + 255) / 256), 256, 0, stream>>>(d0, (int) N, (int) M, reinterpret_cast<const unsigned *>(scal) + 2,
+            m.down_s ? (const float *) m.down_s->data : nullptr, SFB2, (int) kblk_pad, scal);
+        s = lt_set_scales(Pd, pl.wd->SF, SFB2) ? CUBLAS_STATUS_SUCCESS : CUBLAS_STATUS_INVALID_VALUE;
+        if (s == CUBLAS_STATUS_SUCCESS) {
+            lt_tune_plan(st, Pd, Kd, N, M, cc, scal, pl.wd->A, B2, D, ws, stream);
+            s = lt_matmul(st, Pd, Pd.best, scal, pl.wd->A, B2, D, ws, LT_WORKSPACE, stream, m.res ? (const float *) m.res->data : nullptr);
+        }
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return s == CUBLAS_STATUS_SUCCESS;
+}
+
+int ggml_cuda_mul_mat_nvfp4_lt_ffn(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    lt_state &      st  = lt_state_for(ggml_cuda_get_device());
+    const int       cc  = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const ffn_match m   = ffn_match_at(cgraph, node_idx);
+    ffn_plans       pl;
+    const char *    why  = m.why ? m.why : ffn_route_refusal(ctx, st, m, cc, pl);
+    const bool      ran  = why == nullptr && ffn_run(ctx, st, cgraph, node_idx, m, pl, cc);
+    const char *    said = ran ? "ffn chunked" : (why ? why : "a GEMM of the group refused, the plain path computes it");
+    const bool      first = lt_first_time(st, said);
+    if (first && ran) {
+        GGML_LOG_INFO("%s: dense FFNs run their gate and up GEMMs in %" PRId64 " chunks of %" PRId64 " rows on two streams, the GLU quantized per chunk from L2 "
+                      "(first at M=%" PRId64 " N=%" PRId64 " K=%" PRId64 ", %d nodes)\n", __func__, m.gate_w->ne[1] / pl.Mc, pl.Mc, m.gate_w->ne[1], m.x->ne[1], m.x->ne[0], m.n_nodes);
+    } else if (first) {
+        char at[160];
+        describe(at, sizeof(at), m.at ? m.at : cgraph->nodes[node_idx]);
+        GGML_LOG_INFO("nvfp4-lt FFN stays plain: %s (at %s)\n", said, at);
+    }
+    return ran ? m.n_nodes - 1 : 0;
+}
+
 #else // GGML_CUDA_NVFP4_LT
 
 bool ggml_cuda_mul_mat_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
@@ -1083,6 +1444,11 @@ int ggml_cuda_rms_norm_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgra
 }
 
 int ggml_cuda_gated_norm_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
+    GGML_UNUSED_VARS(ctx, cgraph, node_idx);
+    return 0;
+}
+
+int ggml_cuda_mul_mat_nvfp4_lt_ffn(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED_VARS(ctx, cgraph, node_idx);
     return 0;
 }
