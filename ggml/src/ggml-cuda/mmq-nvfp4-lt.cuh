@@ -25,6 +25,13 @@ void ggml_cuda_nvfp4_lt_note_node(const ggml_cgraph * cgraph, int node_idx);
 // (the MUL consumed) or 0 (nothing launched).
 int ggml_cuda_rms_norm_nvfp4_lt(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
 
+// The dense FFN at cgraph->nodes[node_idx], its first NVFP4 matmul: the gate and up matmuls of one input with their one-element
+// scale MULs, the split SWIGLU or GEGLU, the down matmul with its scale MUL and the residual ADD, in consecutive nodes. The gate and
+// up GEMMs run per column chunk whose two F32 slabs stay in L2, the GLU of each chunk is quantized from there, and the down GEMM
+// reads the operand the whole quantize would write. Returns the extra nodes consumed (3 to 7) or 0 (nothing of the graph's tensors
+// written); a refusal's reason is logged once per distinct reason.
+int ggml_cuda_mul_mat_nvfp4_lt_ffn(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx);
+
 // RMS_NORM over 128-wide heads at cgraph->nodes[node_idx], then its weight MUL, the gate's SILU, the MUL that joins them and an
 // optional RESHAPE, in consecutive nodes, read by one NVFP4 matmul this path takes: silu(z) * normed is written straight to FP4
 // at the norm and parked for the matmul. Returns the extra nodes consumed (3 or 4) or 0 (nothing launched); a refusal's reason
