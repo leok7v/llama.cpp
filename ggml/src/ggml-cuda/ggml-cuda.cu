@@ -4575,6 +4575,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // pre-norm whose every consumer is such a matmul, and a gated per-head norm whose five nodes lead to one. Each hook launches
     // nothing and returns 0 when its pattern does not qualify.
     ggml_cuda_nvfp4_lt_note_node(cgraph, i);
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_NVFP4) {
+        const int n_extra_ffn = ggml_cuda_mul_mat_nvfp4_lt_ffn(*cuda_ctx, cgraph, i);
+        if (n_extra_ffn > 0) {
+            return n_extra_ffn;
+        }
+    }
     if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_NVFP4 && i + 1 < cgraph->n_nodes) {
         // the chain behind an NVFP4 matmul: [MUL by its one-element scale] [ADD of a same-shape residual]; the scale folds into
         // alpha, the residual into beta * C, and the last node of the chain is the GEMM's output
