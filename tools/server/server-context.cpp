@@ -312,6 +312,7 @@ struct server_slot {
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
+    int32_t spec_ctx_max = 0; // no drafting at or past this many tokens, 0 = no limit
     int32_t n_keep  = 0;
     int32_t i_batch = -1;
 
@@ -590,6 +591,11 @@ struct server_slot {
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
+        }
+
+        // deep in a long context a draft step and its verification cost more than the accepted tokens save
+        if (spec_ctx_max > 0 && prompt.n_tokens() >= spec_ctx_max) {
+            n_draft_max = 0;
         }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
@@ -1525,6 +1531,7 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
+            slot.spec_ctx_max = params_base.speculative.draft.ctx_max;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
