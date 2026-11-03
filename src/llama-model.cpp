@@ -3202,9 +3202,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         };
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
-                            // QSA runs on the dense-attention layers only
+                            // QSA runs on the layers with a compress ratio; build_layer_attn takes a layer without one as dense
                             filter_idx = [&](uint32_t il) {
-                                return il < hparams.n_layer() && !hparams.is_recr(il);
+                                return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.dsv4_compress_ratios[il] > 0;
                             };
                         }
 
@@ -3212,8 +3212,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
                             filter_recr = [&](uint32_t)    { return false; };
-                            if (filter_idx) {
-                                filter_idx = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            // a dense MTP block (compress ratio 0) gets no indexer cache, so its graph builds no k-pool input
+                            bool mtp_qsa = false;
+                            for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+                                mtp_qsa = mtp_qsa || hparams.dsv4_compress_ratios[il] > 0;
+                            }
+                            if (filter_idx && mtp_qsa) {
+                                filter_idx = [&](uint32_t il) { return il >= hparams.n_layer() && hparams.dsv4_compress_ratios[il] > 0; };
+                            } else {
+                                filter_idx = nullptr;
                             }
                         }
                     }

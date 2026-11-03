@@ -318,6 +318,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
         nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, mtp_flags | TENSOR_ALLOW_RESHAPE);
         nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, mtp_flags);
         nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, mtp_flags);
+
+        if (layers[il].index_q_proj && hparams.dsv4_compress_ratios[il] == 0) {
+            LLAMA_LOG_WARN("%s: MTP block %d carries indexer weights but its compress ratio is 0, so it runs dense attention;"
+                           " a file converted with the MTP block as a QSA layer drafts as the reference does\n", __func__, il);
+        }
     }
 }
 
